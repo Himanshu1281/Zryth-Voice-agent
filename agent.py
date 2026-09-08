@@ -125,12 +125,9 @@ def _build_session(
         ),
         llm=google.LLM(
             model=LLM_MODEL,
-   	    api_key=GOOGLE_API_KEY,        # gemini-3.5-flash
+            api_key=GOOGLE_API_KEY,        # gemini-2.5-flash-lite
             temperature=LLM_TEMPERATURE,
             max_output_tokens=MAX_TOKENS,  # cap reply length -> lower latency
-  	    thinking_config={
-        	"thinking_level": "minimal"
-    	    },
         ),
         tts=sarvam.TTS(
             model=SARVAM_TTS_MODEL,        # bulbul:v3
