@@ -53,7 +53,7 @@ The system uses a best-in-class cascaded pipeline designed for extremely low lat
 - **Telephony (SIP):** **LiveKit SIP Trunk** handles routing standard inbound phone calls into WebRTC rooms, and dialing out to human agents (`transfer_to_human` tool).
 - **Voice Activity Detection (VAD):** **Silero VAD** (running locally). This is tuned heavily to filter background noise while still capturing snappy human interruptions.
 - **Speech-to-Text (STT):** **Sarvam Saaras STT**. Chosen for its native understanding of English-Indic code-mixing (speaking English words amidst Hindi/Telugu sentences).
-- **LLM (The Brain):** **Google Gemini 3.5 Flash**. Chosen for its incredibly fast inference speeds (TTFT) which is vital for voice agents. It routes prompts, processes context, and handles tool invocations.
+- **LLM (The Brain):** **Google Gemini 2.5 Flash-Lite**. Chosen for its incredibly fast inference speeds (TTFT) which is vital for voice agents. It routes prompts, processes context, and handles tool invocations.
 - **Embeddings:** **Google Gemini (gemini-embedding-2)**. Generates semantic vectors for incoming RAG queries.
 - **Text-to-Speech (TTS):** **Sarvam Bulbul TTS**. Generates ultra-realistic Indian-accented speech that streams directly back into the LiveKit pipeline.
 
@@ -93,7 +93,7 @@ sequenceDiagram
         Agent->>DB: `save_message()` saves transcript
         
         %% LLM Thinking & Tool Execution
-        Agent->>AI: Gemini 3.5 processes transcript
+        Agent->>AI: Gemini 2.5 processes transcript
         
         alt RAG Tool Triggered
             AI-->>Agent: Tool Call `search_knowledge`
