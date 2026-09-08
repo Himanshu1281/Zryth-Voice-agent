@@ -13,17 +13,21 @@ load_dotenv()
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_SECRET_KEY = os.getenv("SUPABASE_SECRET_KEY")
 
-if not SUPABASE_URL:
-    raise RuntimeError("SUPABASE_URL is not configured")
+# Only validate when actually creating the client
+supabase: Client | None = None
 
-if not SUPABASE_SECRET_KEY:
-    raise RuntimeError("SUPABASE_SECRET_KEY is not configured")
-
-
-supabase: Client = create_client(
-    SUPABASE_URL,
-    SUPABASE_SECRET_KEY,
-)
+def _init_supabase() -> Client:
+    global supabase
+    if supabase is not None:
+        return supabase
+    
+    if not SUPABASE_URL:
+        raise RuntimeError("SUPABASE_URL is not configured")
+    if not SUPABASE_SECRET_KEY:
+        raise RuntimeError("SUPABASE_SECRET_KEY is not configured")
+    
+    supabase = create_client(SUPABASE_URL, SUPABASE_SECRET_KEY)
+    return supabase
 
 
 IST = timezone(timedelta(hours=5, minutes=30))
@@ -43,7 +47,7 @@ def create_call(
     }
 
     response = (
-        supabase
+        _init_supabase()
         .table("calls")
         .insert(data)
         .execute()
@@ -63,7 +67,7 @@ def save_message(
         return
 
     (
-        supabase
+        _init_supabase()
         .table("messages")
         .insert(
             {
@@ -93,7 +97,7 @@ def update_call_lead(
     if requirement: update_data["requirement"] = requirement
     
     (
-        supabase
+        _init_supabase()
         .table("calls")
         .update(update_data)
         .eq("id", call_id)
@@ -105,7 +109,7 @@ def finish_call(call_id: str, duration_seconds: int = 0) -> None:
     """Mark a call as finished."""
 
     (
-        supabase
+        _init_supabase()
         .table("calls")
         .update(
             {
@@ -122,7 +126,7 @@ if __name__ == "__main__":
     print("Testing Supabase connection...")
 
     (
-        supabase
+        _init_supabase()
         .table("calls")
         .select("id")
         .limit(1)
