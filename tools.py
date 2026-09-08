@@ -17,7 +17,10 @@ from config import DEFAULT_TRANSFER_NUMBER
 from database import supabase, update_call_lead
 
 # Initialize the Gemini client for embeddings
-llm_client = genai.Client(api_key=os.getenv("GOOGLE_API_KEY"))
+if os.getenv('CI') or os.getenv('GITHUB_ACTIONS'):
+    llm_client = None
+else:
+    llm_client = genai.Client(api_key=os.getenv("GOOGLE_API_KEY"))
 
 log = logging.getLogger("voice-agent.tools")
 
