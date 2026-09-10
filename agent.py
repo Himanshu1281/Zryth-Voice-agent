@@ -288,7 +288,7 @@ async def entrypoint(ctx: JobContext) -> None:
     )
 
     # Save customer and Maya messages.
-    async def on_conversation_item(event) -> None:
+    def on_conversation_item(event) -> None:
         item = event.item
 
         role = getattr(item, "role", None)
@@ -304,19 +304,20 @@ async def entrypoint(ctx: JobContext) -> None:
         else:
             return
 
-        try:
-            import asyncio
-            await asyncio.to_thread(
-                save_message,
-                call_id=call_id,
-                speaker=speaker,
-                message=text,
-            )
-            log.info("Saved %s message", speaker)
-
-        except Exception:
-            # Never allow database issues to break the live call.
-            log.exception("Failed to save conversation message")
+        def _do_save():
+            try:
+                save_message(
+                    call_id=call_id,
+                    speaker=speaker,
+                    message=text,
+                )
+                log.info("Saved %s message", speaker)
+            except Exception:
+                # Never allow database issues to break the live call.
+                log.exception("Failed to save conversation message")
+                
+        import asyncio
+        asyncio.create_task(asyncio.to_thread(_do_save))
 
     session.on(
         "conversation_item_added",
