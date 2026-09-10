@@ -288,7 +288,7 @@ async def entrypoint(ctx: JobContext) -> None:
     )
 
     # Save customer and Maya messages.
-    def on_conversation_item(event) -> None:
+    async def on_conversation_item(event) -> None:
         item = event.item
 
         role = getattr(item, "role", None)
@@ -305,7 +305,9 @@ async def entrypoint(ctx: JobContext) -> None:
             return
 
         try:
-            save_message(
+            import asyncio
+            await asyncio.to_thread(
+                save_message,
                 call_id=call_id,
                 speaker=speaker,
                 message=text,

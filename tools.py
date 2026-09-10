@@ -14,7 +14,7 @@ from google import genai
 from livekit.agents import JobContext, RunContext, function_tool
 
 from config import DEFAULT_TRANSFER_NUMBER
-from database import supabase, update_call_lead
+from database import _init_supabase, update_call_lead
 
 # Initialize the Gemini client for embeddings
 if os.getenv('CI') or os.getenv('GITHUB_ACTIONS'):
@@ -97,7 +97,8 @@ class AppointmentTools:
         """
 
         if self.call_id:
-            update_call_lead(
+            await asyncio.to_thread(
+                update_call_lead,
                 call_id=self.call_id,
                 customer_name=name,
                 phone=phone,
@@ -131,21 +132,25 @@ class AppointmentTools:
         
         try:
             # 1. Embed the query
-            response = llm_client.models.embed_content(
+            response = await asyncio.to_thread(
+                llm_client.models.embed_content,
                 model='gemini-embedding-001',
                 contents=query,
             )
             embedding = response.embeddings[0].values
             
             # 2. Query Supabase
-            rpc_response = supabase.rpc(
-                'match_knowledge', 
-                {
-                    'query_embedding': embedding, 
-                    'match_threshold': 0.45, 
-                    'match_count': 5
-                }
-            ).execute()
+            def fetch_rpc():
+                return _init_supabase().rpc(
+                    'match_knowledge', 
+                    {
+                        'query_embedding': embedding, 
+                        'match_threshold': 0.45, 
+                        'match_count': 5
+                    }
+                ).execute()
+            
+            rpc_response = await asyncio.to_thread(fetch_rpc)
             
             # 3. Format results
             if not rpc_response.data:
@@ -190,7 +195,8 @@ class AppointmentTools:
         """
 
         if self.call_id:
-            update_call_lead(
+            await asyncio.to_thread(
+                update_call_lead,
                 call_id=self.call_id,
                 customer_name=name,
                 phone=phone,
