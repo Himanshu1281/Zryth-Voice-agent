@@ -57,7 +57,7 @@ def _save_lead(lead: dict) -> None:
 
 
 class AppointmentTools:
-    """Tools Maya can use during a Zryth customer call."""
+    """Tools the agent can use during a customer call."""
 
     def __init__(self, job_ctx: JobContext | None = None, call_id: str | None = None) -> None:
         self.job_ctx = job_ctx
@@ -76,7 +76,7 @@ class AppointmentTools:
     async def capture_lead(
         self,
         context: RunContext,
-        name: str,
+        name: Optional[str] = None,
         phone: Optional[str] = None,
         email: Optional[str] = None,
         company: Optional[str] = None,
@@ -84,7 +84,7 @@ class AppointmentTools:
     ) -> dict:
         """Save a potential customer's enquiry.
 
-        Use this when the caller is interested in Zryth's services and
+        Use this when the caller is interested in the company's services and
         you have collected their name plus at least one contact method.
 
         Args:
@@ -97,10 +97,9 @@ class AppointmentTools:
         """
 
         if self.call_id:
-            await asyncio.to_thread(
-                update_call_lead,
+            await update_call_lead(
                 call_id=self.call_id,
-                customer_name=name,
+                customer_name=name or "Unknown",
                 phone=phone,
                 email=email,
                 company=company,
@@ -119,10 +118,10 @@ class AppointmentTools:
         self,
         context: RunContext,
         query: str,
-    ) -> str:
-        """Search the Zryth knowledge base for product details, features, or pricing.
+    ) -> dict:
+        """Search the company knowledge base for product details, features, or pricing.
         
-        Use this tool when the user asks a specific question about Zryth's offerings.
+        Use this tool when the user asks a specific question about the company's offerings.
         Do NOT guess; always look it up.
         
         Args:
@@ -132,16 +131,16 @@ class AppointmentTools:
         
         try:
             # 1. Embed the query
-            response = await asyncio.to_thread(
-                llm_client.models.embed_content,
-                model='gemini-embedding-001',
+            response = await llm_client.aio.models.embed_content(
+                model='gemini-embedding-2',
                 contents=query,
             )
             embedding = response.embeddings[0].values
             
             # 2. Query Supabase
-            def fetch_rpc():
-                return _init_supabase().rpc(
+            client = await _init_supabase()
+            rpc_response = await (
+                client.rpc(
                     'match_knowledge', 
                     {
                         'query_embedding': embedding, 
@@ -149,28 +148,27 @@ class AppointmentTools:
                         'match_count': 5
                     }
                 ).execute()
-            
-            rpc_response = await asyncio.to_thread(fetch_rpc)
+            )
             
             # 3. Format results
             if not rpc_response.data:
-                return "No relevant information found in the knowledge base."
+                return {"status": "no_results", "message": "No relevant information found in the knowledge base."}
                 
             results = []
             for row in rpc_response.data:
                 results.append(row['content'])
                 
-            return "\n\n".join(results)
+            return {"status": "success", "results": "\n\n".join(results)}
             
         except Exception as e:
             log.error(f"search_knowledge error: {e}")
-            return "An error occurred while searching the knowledge base."
+            return {"status": "error", "message": "An error occurred while searching the knowledge base."}
 
     @function_tool
     async def book_consultation(
         self,
         context: RunContext,
-        name: str,
+        name: Optional[str] = None,
         phone: Optional[str] = None,
         email: Optional[str] = None,
         company: Optional[str] = None,
@@ -178,9 +176,9 @@ class AppointmentTools:
         preferred_date: Optional[str] = None,
         preferred_time: Optional[str] = None,
     ) -> dict:
-        """Record a request for a Zryth consultation.
+        """Record a request for a consultation.
 
-        Use when the caller wants to discuss a project with the Zryth team.
+        Use when the caller wants to discuss a project with the team.
         Collect their name and at least one contact method before calling
         this tool.
 
@@ -195,10 +193,9 @@ class AppointmentTools:
         """
 
         if self.call_id:
-            await asyncio.to_thread(
-                update_call_lead,
+            await update_call_lead(
                 call_id=self.call_id,
-                customer_name=name,
+                customer_name=name or "Unknown",
                 phone=phone,
                 email=email,
                 company=company,
@@ -211,7 +208,7 @@ class AppointmentTools:
             "status": "requested",
             "message": (
                 "The consultation request has been recorded. "
-                "The Zryth team will follow up to confirm the appointment."
+                "Our team will follow up to confirm the appointment."
             ),
         }
 
@@ -220,7 +217,7 @@ class AppointmentTools:
         self,
         context: RunContext,
     ) -> dict:
-        """Transfer the caller to a Zryth team member.
+        """Transfer the caller to a human team member.
 
         Use when the caller specifically asks to speak with a human,
         asks for a team member, or the request requires human assistance.
@@ -258,7 +255,7 @@ class AppointmentTools:
             
         # Explicitly push the goodbye message into the TTS queue since the LLM often 
         # drops text output when invoking tools.
-        await context.session.say("Thank you for your interest in Z-rith. Have a great day! Goodbye.")
+        await context.session.say("Thank you for your interest. Have a great day! Goodbye.")
 
 	# Give the goodbye response plenty of time to finish playing before shutting down.
         import asyncio
@@ -277,7 +274,7 @@ if __name__ == "__main__":
     DATA_DIR.mkdir(exist_ok=True)
 
     print("tools.py self-check passed")
-    print("Zryth tools available:")
+    print("Agent tools available:")
     print("- capture_lead")
     print("- book_consultation")
     print("- transfer_to_human")

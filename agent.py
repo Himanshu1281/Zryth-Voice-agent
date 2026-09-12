@@ -47,7 +47,7 @@ from livekit.agents import (
     function_tool,
     metrics,
 )
-from livekit.plugins import google, sarvam, silero
+from livekit.plugins import openai, sarvam, silero
 
 from config import (
     AGENT_NAME,
@@ -58,6 +58,7 @@ from config import (
     MAX_TOKENS,
     MIN_ENDPOINTING_DELAY,
     GOOGLE_API_KEY,
+    GROQ_API_KEY,
     LLM_MODEL,
     LLM_TEMPERATURE,
     SARVAM_STT_MODEL,
@@ -90,10 +91,6 @@ METRICS_LOG = Path(__file__).parent / "logs" / "metrics.jsonl"
 CONFIRMATIONS: dict[str, str] = {
     "en": "Perfect, we'll continue in English.",
     "hi": "ठीक है, अब हम हिंदी में बात करेंगे।",
-    "ta": "சரி, இனி நாம் தமிழில் பேசுவோம்.",
-    "te": "సరే, ఇప్పటి నుండి మనం తెలుగులో మాట్లాడుకుందాం.",
-    "kn": "ಸರಿ, ಇನ್ನು ನಾವು ಕನ್ನಡದಲ್ಲಿ ಮಾತನಾಡೋಣ.",
-    "ml": "ശരി, ഇനി നമുക്ക് മലയാളത്തിൽ സംസാരിക്കാം.",
 }
 
 
@@ -123,11 +120,13 @@ def _build_session(
             language=bcp47,
             sample_rate=AUDIO_SAMPLE_RATE,  # 8 kHz telephony
         ),
-        llm=google.LLM(
+        llm=openai.LLM(
             model=LLM_MODEL,
-            api_key=GOOGLE_API_KEY,        # gemini-2.5-flash-lite
+            client=__import__("openai").AsyncClient(
+                api_key=GROQ_API_KEY,
+                base_url="https://api.groq.com/openai/v1",
+            ),
             temperature=LLM_TEMPERATURE,
-            max_output_tokens=MAX_TOKENS,  # cap reply length -> lower latency
         ),
         tts=sarvam.TTS(
             model=SARVAM_TTS_MODEL,        # bulbul:v3
@@ -153,7 +152,7 @@ GREETER_INSTRUCTIONS = (
     HOT_PERSONA
     + "\n\nYou are greeting the caller in English. Listen for the language they "
     "speak or ask for. The moment you know it, call the set_language tool with the "
-    "code (en, hi, ta, te, kn, ml). Do not dive into property questions before the "
+    "code (en, hi). Do not dive into property questions before the "
     "language is set."
 )
 
@@ -166,7 +165,7 @@ class BaseMayaAgent(Agent):
         """Switch the whole conversation to the caller's preferred language.
 
         Args:
-            language: one of en, hi, ta, te, kn, ml.
+            language: one of en, hi.
         """
         code = language.strip().lower()
         if code not in SUPPORTED_LANGUAGES:
@@ -183,8 +182,10 @@ class BaseMayaAgent(Agent):
         # ---------------------------------------------------------------------
         await context.session.say(CONFIRMATIONS[code])
         context.session.update_agent(LangAgent(code))
-        # We already voiced the confirmation, so return nothing (no extra reply).
-        return None
+        
+        # We voiced the confirmation, but we must also return a string so the LLM
+        # continues its turn and answers any pending questions the user asked.
+        return f"Language swapped to {code}. You MUST now answer the user's question in {code}."
 
 
 class GreeterAgent(BaseMayaAgent):
@@ -253,6 +254,10 @@ def _make_metrics_handler(call_id: str):
 
 # --- entrypoint --------------------------------------------------------------
 async def entrypoint(ctx: JobContext) -> None:
+    import asyncio
+    import concurrent.futures
+    loop = asyncio.get_running_loop()
+    loop.set_default_executor(concurrent.futures.ThreadPoolExecutor(max_workers=200))
     await ctx.connect()
 
     # Try to extract phone from room name or metadata
@@ -265,7 +270,7 @@ async def entrypoint(ctx: JobContext) -> None:
     start_time = time.time()
 
     # Create one Supabase record for this call.
-    call_id = create_call(
+    call_id = await create_call(
         livekit_room=ctx.room.name,
         phone=phone,
         language=DEFAULT_LANGUAGE,
@@ -304,9 +309,9 @@ async def entrypoint(ctx: JobContext) -> None:
         else:
             return
 
-        def _do_save():
+        async def _do_save():
             try:
-                save_message(
+                await save_message(
                     call_id=call_id,
                     speaker=speaker,
                     message=text,
@@ -317,7 +322,7 @@ async def entrypoint(ctx: JobContext) -> None:
                 log.exception("Failed to save conversation message")
                 
         import asyncio
-        asyncio.create_task(asyncio.to_thread(_do_save))
+        asyncio.create_task(_do_save())
 
     session.on(
         "conversation_item_added",
@@ -328,7 +333,7 @@ async def entrypoint(ctx: JobContext) -> None:
     async def on_shutdown(reason: str = "") -> None:
         try:
             duration_seconds = int(time.time() - start_time)
-            finish_call(call_id, duration_seconds)
+            await finish_call(call_id, duration_seconds)
             log.info(
                 "Supabase call finished: %s reason=%s",
                 call_id,
@@ -346,7 +351,7 @@ async def entrypoint(ctx: JobContext) -> None:
 
     # Save Maya's opening greeting.
     try:
-        save_message(
+        await save_message(
             call_id=call_id,
             speaker="maya",
             message=GREETINGS[DEFAULT_LANGUAGE],

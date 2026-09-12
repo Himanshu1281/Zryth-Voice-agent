@@ -14,7 +14,8 @@ livekit-plugins-sarvam>=1.4.2  # Sarvam Saaras STT + Bulbul TTS (Indian language
                                # before it, the speaker check does not know them.
                                # Verified against 1.5.8 and 1.7.1.
 livekit-plugins-silero        # Silero VAD (end-of-utterance detection)
-livekit-plugins-google        # Google Gemini LLM
+livekit-plugins-google        # Google Gemini LLM (kept for embeddings)
+livekit-plugins-openai        # OpenAI protocol (used for Groq)
 
 # LiveKit server/SIP API client (dispatch rules, SIP transfer, room admin).
 livekit-api

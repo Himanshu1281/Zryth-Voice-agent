@@ -5,8 +5,8 @@ from datetime import datetime, timezone, timedelta
 from typing import Optional
 
 from dotenv import load_dotenv
-from supabase import Client, create_client
-
+from supabase import create_async_client
+from supabase.client import AsyncClient
 
 load_dotenv()
 
@@ -14,9 +14,9 @@ SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_SECRET_KEY = os.getenv("SUPABASE_SECRET_KEY")
 
 # Only validate when actually creating the client
-supabase: Client | None = None
+supabase: AsyncClient | None = None
 
-def _init_supabase() -> Client:
+async def _init_supabase() -> AsyncClient:
     global supabase
     if supabase is not None:
         return supabase
@@ -26,13 +26,13 @@ def _init_supabase() -> Client:
     if not SUPABASE_SECRET_KEY:
         raise RuntimeError("SUPABASE_SECRET_KEY is not configured")
     
-    supabase = create_client(SUPABASE_URL, SUPABASE_SECRET_KEY)
+    supabase = await create_async_client(SUPABASE_URL, SUPABASE_SECRET_KEY)
     return supabase
 
 
 IST = timezone(timedelta(hours=5, minutes=30))
 
-def create_call(
+async def create_call(
     livekit_room: str,
     phone: Optional[str] = None,
     language: str = "en",
@@ -46,8 +46,9 @@ def create_call(
         "started_at": datetime.now(IST).isoformat(),
     }
 
-    response = (
-        _init_supabase()
+    client = await _init_supabase()
+    response = await (
+        client
         .table("calls")
         .insert(data)
         .execute()
@@ -56,7 +57,7 @@ def create_call(
     return response.data[0]["id"]
 
 
-def save_message(
+async def save_message(
     call_id: str,
     speaker: str,
     message: str,
@@ -66,8 +67,9 @@ def save_message(
     if not message or not message.strip():
         return
 
-    (
-        _init_supabase()
+    client = await _init_supabase()
+    await (
+        client
         .table("messages")
         .insert(
             {
@@ -80,7 +82,7 @@ def save_message(
     )
 
 
-def update_call_lead(
+async def update_call_lead(
     call_id: str,
     customer_name: str,
     phone: Optional[str] = None,
@@ -96,8 +98,9 @@ def update_call_lead(
     if company: update_data["company"] = company
     if requirement: update_data["requirement"] = requirement
     
-    (
-        _init_supabase()
+    client = await _init_supabase()
+    await (
+        client
         .table("calls")
         .update(update_data)
         .eq("id", call_id)
@@ -105,11 +108,12 @@ def update_call_lead(
     )
 
 
-def finish_call(call_id: str, duration_seconds: int = 0) -> None:
+async def finish_call(call_id: str, duration_seconds: int = 0) -> None:
     """Mark a call as finished."""
 
-    (
-        _init_supabase()
+    client = await _init_supabase()
+    await (
+        client
         .table("calls")
         .update(
             {
@@ -123,15 +127,21 @@ def finish_call(call_id: str, duration_seconds: int = 0) -> None:
 
 
 if __name__ == "__main__":
-    print("Testing Supabase connection...")
-
-    (
-        _init_supabase()
-        .table("calls")
-        .select("id")
-        .limit(1)
-        .execute()
-    )
-
-    print("Supabase connection OK")
-    print("calls table is accessible")
+    import asyncio
+    
+    async def test():
+        print("Testing Supabase connection...")
+    
+        client = await _init_supabase()
+        await (
+            client
+            .table("calls")
+            .select("id")
+            .limit(1)
+            .execute()
+        )
+    
+        print("Supabase connection OK")
+        print("calls table is accessible")
+        
+    asyncio.run(test())

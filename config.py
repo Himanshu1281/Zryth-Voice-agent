@@ -37,9 +37,10 @@ SARVAM_TTS_MODEL = os.getenv("SARVAM_TTS_MODEL", "bulbul:v3")
 SARVAM_TTS_VOICE = os.getenv("SARVAM_TTS_VOICE", "simran")
 
 
-# --- Google Gemini (LLM) ------------------------------------------------------------
+# --- Google Gemini & Groq (LLM) ------------------------------------------------------------
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
-LLM_MODEL = os.getenv("LLM_MODEL", "gemini-2.5-flash-lite")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
+LLM_MODEL = os.getenv("LLM_MODEL", "llama-3.1-8b-instant")
 LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.3"))
 # Hard cap on reply length. Short replies = lower TTS/LLM latency on a phone call.
 MAX_TOKENS = int(os.getenv("MAX_TOKENS", "150"))
@@ -76,9 +77,5 @@ DEFAULT_TRANSFER_NUMBER = os.getenv("DEFAULT_TRANSFER_NUMBER", "+91XXXXXXXXXX")
 BCP47: dict[str, str] = {
     "en": "en-IN",
     "hi": "hi-IN",
-    "ta": "ta-IN",
-    "te": "te-IN",
-    "kn": "kn-IN",
-    "ml": "ml-IN",
 }
 SUPPORTED_LANGUAGES: list[str] = list(BCP47.keys())
