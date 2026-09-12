@@ -59,9 +59,10 @@ def _save_lead(lead: dict) -> None:
 class AppointmentTools:
     """Tools the agent can use during a customer call."""
 
-    def __init__(self, job_ctx: JobContext | None = None, call_id: str | None = None) -> None:
+    def __init__(self, job_ctx: JobContext | None = None, call_id: str | None = None, agent_id: str | None = None) -> None:
         self.job_ctx = job_ctx
         self.call_id = call_id
+        self.agent_id = agent_id
 
     def to_tools(self) -> list:
         return [
@@ -145,7 +146,8 @@ class AppointmentTools:
                     {
                         'query_embedding': embedding, 
                         'match_threshold': 0.45, 
-                        'match_count': 5
+                        'match_count': 5,
+                        'p_agent_id': self.agent_id,
                     }
                 ).execute()
             )

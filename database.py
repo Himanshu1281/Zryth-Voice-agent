@@ -33,28 +33,65 @@ async def _init_supabase() -> AsyncClient:
 IST = timezone(timedelta(hours=5, minutes=30))
 
 async def create_call(
+    call_id: str,
     livekit_room: str,
+    agent_id: str,
     phone: Optional[str] = None,
     language: str = "en",
-) -> str:
-    """Create a call record and return its Supabase UUID."""
+) -> None:
+    """Create a call record and insert it into Supabase."""
 
     data = {
+        "id": call_id,
         "livekit_room": livekit_room,
+        "agent_id": agent_id,
         "phone": phone,
         "language": language,
         "started_at": datetime.now(IST).isoformat(),
     }
 
     client = await _init_supabase()
-    response = await (
+    await (
         client
         .table("calls")
         .insert(data)
         .execute()
     )
 
-    return response.data[0]["id"]
+async def get_agent_by_did(did: str) -> Optional[dict]:
+    """Fetch the agent configuration for a given dial-in number."""
+    if not did:
+        return None
+
+    client = await _init_supabase()
+    response = await (
+        client
+        .table("agents")
+        .select("*")
+        .eq("did_number", did)
+        .limit(1)
+        .execute()
+    )
+
+    if response.data:
+        return response.data[0]
+    return None
+
+async def get_default_agent() -> Optional[dict]:
+    """Fetch any live agent config to use as a fallback for sandbox/console testing."""
+    client = await _init_supabase()
+    response = await (
+        client
+        .table("agents")
+        .select("*")
+        .eq("status", "live")
+        .limit(1)
+        .execute()
+    )
+
+    if response.data:
+        return response.data[0]
+    return None
 
 
 async def save_message(

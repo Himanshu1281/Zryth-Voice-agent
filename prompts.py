@@ -15,17 +15,51 @@ from pathlib import Path
 # Where the per-language grammar sheets live (grammar/agent_<lang>_grammar.md).
 GRAMMAR_DIR = Path(__file__).parent / "grammar"
 
-# The one persona prompt, shared by every language agent. Keep it tight.
+USE_CASE_TEMPLATES: dict[str, str] = {
+    "promotional": (
+        "Lead with {company}'s current offers. Be upbeat and concise. "
+        "Always try to end with a clear next step."
+    ),
+    "lead_generation": (
+        "Ask qualifying questions (need, timeline, budget) ONE BY ONE. Do not ask "
+        "multiple questions in a single response. Capture the caller's name and a "
+        "contact method before the call ends. Call capture_lead as soon as you have "
+        "a name and one contact method."
+    ),
+    "support": (
+        "Answer only from search_knowledge results. If there's no answer, say so "
+        "and offer transfer_to_human. Never invent information."
+    ),
+    "custom": "",
+}
 
+# Non-negotiable, not editable by any client config.
+GUARDRAILS = (
+    "You MUST use the search_knowledge tool for any question about {company}'s "
+    "products, pricing, or features. Never guess. If asked about anything "
+    "unrelated to {company}, politely decline and redirect. CRITICAL RULE: "
+    "Keep responses to a maximum of 1 to 2 short lines. Never ask more than "
+    "one question at a time."
+)
 
-HOT_PERSONA = """
-You are a friendly voice assistant for the company.
-For specific questions about the company's products, pricing, or features, you MUST use the search_knowledge tool. Answer concisely based ONLY on the tool's results. Do not guess. If the search_knowledge tool returns no information or an error, politely inform the user that you don't have that information.
-CRITICAL RULE: If the user asks about ANYTHING unrelated to the company or its products (e.g. general knowledge, internet search, other companies like Google), you MUST politely refuse to answer and state that you can only assist with company-related inquiries. Do not provide information outside your knowledge base.
-Answer conversational questions naturally. Keep responses extremely brief, 1 to 2 short sentences max. Start responses with natural conversational fillers (like "Got it", "I understand", "Right") to feel human. Treat short replies ("yes", "okay") as acknowledgements. Preserve names exactly.
-Use capture_lead for interested callers, book_consultation for confirmed bookings, transfer_to_human when needed (say "our team", NEVER "human"), and end_call when finished. When collecting contact info, never bluntly ask for a phone number. Instead, ask: "Would you like our team to contact you on this same number, or provide an alternate?"
-CRITICAL: You MUST always speak a verbal response out loud immediately after receiving results from the search_knowledge tool. Never stay silent.
-"""
+def build_persona(agent_row: dict) -> str:
+    company = agent_row["company_name"]
+    template = USE_CASE_TEMPLATES.get(agent_row["use_case"], "")
+    custom = (agent_row.get("custom_instructions") or "").strip()
+
+    parts = [
+        f"You are {agent_row['agent_name']}, the voice assistant for {company}.",
+        GUARDRAILS.format(company=company),
+        template.format(company=company) if template else "",
+        custom,
+    ]
+    persona = "\n".join(p for p in parts if p)
+
+    # Same discipline as before — this is still the biggest latency lever.
+    # Don't let a client's custom_instructions blow the per-turn token budget.
+    if len(persona) > 900:
+        persona = persona[:900].rsplit(".", 1)[0] + "."
+    return persona
 
 
 CONVERSATION_ENDING = """
@@ -57,8 +91,8 @@ STYLE_NOTES: dict[str, str] = {
 
 # What the agent says first when a call connects, per language.
 GREETINGS: dict[str, str] = {
-    "en": "Hi, thanks for calling! I'm the AI assistant. How can I help you today?",
-    "hi": "नमस्ते, कॉल करने के लिए धन्यवाद! मैं AI असिस्टेंट हूँ। मैं आपकी कैसे मदद कर सकती हूँ?",
+    "en": "Hi, thanks for calling {company_name}! I'm {agent_name}, the AI assistant. How can I help you today?",
+    "hi": "नमस्ते, {company_name} में कॉल करने के लिए धन्यवाद! मैं {agent_name} हूँ, आपकी AI असिस्टेंट। मैं आपकी कैसे मदद कर सकती हूँ?",
 }
 
 
@@ -77,13 +111,12 @@ def load_grammar(language: str) -> str:
         return ""
 
 
-def build_instructions(language: str, script: str, include_grammar: bool = True) -> str:
+def build_instructions(language: str, script: str, persona: str, include_grammar: bool = True) -> str:
     """Compose the full system prompt for a per-language agent.
 
-    `language` is a short code (en/hi/ta/...); `script` is the tiny per-language
-    style note (usually STYLE_NOTES[language]). The bulk (HOT_PERSONA) stays the
-    same across languages -- we bolt on a one-line language rule, then (if
-    available) the full grammar sheet for that language.
+    `language` is a short code (en/hi/...); `script` is the tiny per-language
+    style note (usually STYLE_NOTES[language]). `persona` is the dynamically assembled
+    persona for the specific agent.
 
     Latency tradeoff: the grammar sheet adds input tokens every turn, which raises
     LLM time-to-first-token a little. It buys much more natural, native-sounding
@@ -91,23 +124,24 @@ def build_instructions(language: str, script: str, include_grammar: bool = True)
     if you need to shave the last few ms. See docs/04-latency.md.
     """
     name = LANG_NAMES.get(language, language)
-    base = f"{HOT_PERSONA}\n\nRespond only in {name}. {script}\n\nIf the caller asks to speak in a different language, immediately call the set_language tool with the language code (en, hi).\n\n{CONVERSATION_ENDING}"
+    base = f"{persona}\n\nRespond only in {name}. {script}\n\nIf the caller asks to speak in a different language, immediately call the set_language tool with the language code (en, hi).\n\n{CONVERSATION_ENDING}"
     grammar = load_grammar(language) if include_grammar else ""
     return f"{base}\n\n{grammar}" if grammar else base
 
 
 if __name__ == "__main__":
     # Self-check: the persona must stay short (latency) and every language must
-    # have parallel copy so nothing goes silent after a language switch.
-    assert len(HOT_PERSONA) <= 1500, f"HOT_PERSONA too long: {len(HOT_PERSONA)} chars"
+    mock_agent = {"agent_name": "TestBot", "company_name": "TestCo", "use_case": "promotional", "custom_instructions": ""}
+    test_persona = build_persona(mock_agent)
+    assert len(test_persona) <= 1500, f"Persona too long: {len(test_persona)} chars"
     for _code in LANG_NAMES:
         assert _code in STYLE_NOTES, f"missing STYLE_NOTES[{_code}]"
         assert _code in GREETINGS, f"missing GREETINGS[{_code}]"
-    assert "assistant" in build_instructions("hi", STYLE_NOTES["hi"])
+    assert "TestBot" in build_instructions("hi", STYLE_NOTES["hi"], test_persona)
     # Grammar sheets should exist and get appended when present.
     for _code in LANG_NAMES:
         assert load_grammar(_code), f"missing/empty grammar sheet for {_code}"
-    _with = build_instructions("ta", STYLE_NOTES["ta"], include_grammar=True)
-    _without = build_instructions("ta", STYLE_NOTES["ta"], include_grammar=False)
+    _with = build_instructions("en", STYLE_NOTES["en"], test_persona, include_grammar=True)
+    _without = build_instructions("en", STYLE_NOTES["en"], test_persona, include_grammar=False)
     assert len(_with) > len(_without), "grammar sheet was not appended"
-    print(f"prompts.py self-check passed (HOT_PERSONA={len(HOT_PERSONA)} chars, grammar wired)")
+    print(f"prompts.py self-check passed (Persona={len(test_persona)} chars, grammar wired)")

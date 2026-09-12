@@ -1,4 +1,4 @@
-"""Maya -- the Acme Realty inbound voice agent (LiveKit Agents worker).
+"""AI voice agent (LiveKit Agents worker).
 
 Run it:
     python agent.py start          # register with LiveKit and take calls
@@ -19,11 +19,10 @@ import json
 import logging
 import os
 import time
+import uuid
 from pathlib import Path
 
 # --- TLS / cert guard (optional) --------------------------------------------
-# On some minimal VPS images the system CA bundle is missing and Sarvam/Google
-# TLS handshakes fail. Pointing at certifi's bundle avoids that. Best-effort.
 try:
     import certifi
 
@@ -50,14 +49,11 @@ from livekit.agents import (
 from livekit.plugins import openai, sarvam, silero
 
 from config import (
-    AGENT_NAME,
     AUDIO_SAMPLE_RATE,
     BCP47,
-    DEFAULT_LANGUAGE,
     MAX_ENDPOINTING_DELAY,
     MAX_TOKENS,
     MIN_ENDPOINTING_DELAY,
-    GOOGLE_API_KEY,
     GROQ_API_KEY,
     LLM_MODEL,
     LLM_TEMPERATURE,
@@ -71,90 +67,70 @@ from config import (
 )
 from prompts import (
     GREETINGS,
-    HOT_PERSONA,
     STYLE_NOTES,
     build_instructions,
+    build_persona,
 )
 from tools import AppointmentTools
 
-from database import create_call, save_message, finish_call
+from database import create_call, save_message, finish_call, get_agent_by_did, get_default_agent
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("voice-agent")
 
-# Per-stage latency lands here as JSONL, one row per metric. The dashboard
-# (dashboard/build_dashboard.py) reads this to colour-code each call.
 METRICS_LOG = Path(__file__).parent / "logs" / "metrics.jsonl"
 
-# Confirmation phrase spoken the moment we switch language, IN that language.
-# These MUST exist for every supported language -- see set_language for why.
-CONFIRMATIONS: dict[str, str] = {
-    "en": "Perfect, we'll continue in English.",
-    "hi": "ठीक है, अब हम हिंदी में बात करेंगे।",
-}
+def prewarm(proc: agents.JobProcess):
+    """Run once per worker to load heavy models and persistent clients."""
+    proc.userdata["vad"] = silero.VAD.load(
+        min_silence_duration=VAD_MIN_SILENCE_S,
+        activation_threshold=VAD_ACTIVATION_THRESHOLD,
+        min_speech_duration=VAD_MIN_SPEECH_DURATION,
+        sample_rate=AUDIO_SAMPLE_RATE,
+    )
+    proc.userdata["groq_client"] = __import__("openai").AsyncClient(
+        api_key=GROQ_API_KEY,
+        base_url="https://api.groq.com/openai/v1",
+    )
 
-
-# --- pipeline wiring ---------------------------------------------------------
 def _build_session(
     language: str,
     job_ctx: JobContext,
     call_id: str,
+    agent_id: str,
 ) -> AgentSession:
-
-    """Wire the whole cascade for a starting language and return the session.
-    Silero VAD + Sarvam STT/TTS locked to `language`, Google Gemini LLM, Maya's tools,
-    and tight endpointing. The session owns the tools and default pipeline;
-    each LangAgent later overrides only STT + TTS to relock the language.
-    """
     bcp47 = BCP47[language]
     return AgentSession(
-        vad=silero.VAD.load(
-            min_silence_duration=VAD_MIN_SILENCE_S,
-            activation_threshold=VAD_ACTIVATION_THRESHOLD,
-            min_speech_duration=VAD_MIN_SPEECH_DURATION,
-            sample_rate=AUDIO_SAMPLE_RATE,
-        ),
+        vad=job_ctx.proc.userdata["vad"],
         stt=sarvam.STT(
-            model=SARVAM_STT_MODEL,       # saaras:v3
-            mode="codemix",               # keep English words spoken mid-sentence
+            model=SARVAM_STT_MODEL,
+            mode="codemix",
             language=bcp47,
-            sample_rate=AUDIO_SAMPLE_RATE,  # 8 kHz telephony
+            sample_rate=AUDIO_SAMPLE_RATE,
         ),
         llm=openai.LLM(
             model=LLM_MODEL,
-            client=__import__("openai").AsyncClient(
-                api_key=GROQ_API_KEY,
-                base_url="https://api.groq.com/openai/v1",
-            ),
+            client=job_ctx.proc.userdata["groq_client"],
             temperature=LLM_TEMPERATURE,
+            max_completion_tokens=MAX_TOKENS,
         ),
         tts=sarvam.TTS(
-            model=SARVAM_TTS_MODEL,        # bulbul:v3
+            model=SARVAM_TTS_MODEL,
             target_language_code=bcp47,
-            speaker=SARVAM_TTS_VOICE,      # Sirman
-            pace=1.10,                     # 15% faster speech pace
+            speaker=SARVAM_TTS_VOICE,
+            pace=1.10,
             min_buffer_size=30,
             max_chunk_length=80,      
         ),
-	tools=AppointmentTools(job_ctx, call_id).to_tools(),
+        tools=AppointmentTools(job_ctx, call_id, agent_id).to_tools(),
         turn_handling=TurnHandlingOptions(
             endpointing={
                 "mode": "fixed",
                 "min_delay": MIN_ENDPOINTING_DELAY,
                 "max_delay": MAX_ENDPOINTING_DELAY,
             },
-        ),  # 1.0 s
+        ),
     )
-
-
-# --- agents ------------------------------------------------------------------
-GREETER_INSTRUCTIONS = (
-    HOT_PERSONA
-    + "\n\nYou are greeting the caller in English. Listen for the language they "
-    "speak or ask for. The moment you know it, call the set_language tool with the "
-    "code (en, hi). Do not dive into property questions before the "
-    "language is set."
-)
 
 
 class BaseMayaAgent(Agent):
@@ -169,40 +145,41 @@ class BaseMayaAgent(Agent):
         """
         code = language.strip().lower()
         if code not in SUPPORTED_LANGUAGES:
-            # Don't swap on an unknown code -- tell the LLM so it can re-ask.
             return f"Language '{language}' is not supported. Supported: {', '.join(SUPPORTED_LANGUAGES)}."
 
-        # ---------------------------------------------------------------------
-        # WHY we speak BEFORE swapping (do NOT reorder):
-        # session.update_agent() swaps the active agent SILENTLY -- the new
-        # agent does NOT automatically say anything. If we swap first and expect
-        # the new LangAgent to greet, the call goes to DEAD AIR. That was a real,
-        # painful production bug. So we emit the confirmation on the CURRENT
-        # session first, THEN swap.
-        # ---------------------------------------------------------------------
-        await context.session.say(CONFIRMATIONS[code])
-        context.session.update_agent(LangAgent(code))
+        context.session.update_agent(LangAgent(code, self.persona, self.agent_row))
         
-        # We voiced the confirmation, but we must also return a string so the LLM
-        # continues its turn and answers any pending questions the user asked.
-        return f"Language swapped to {code}. You MUST now answer the user's question in {code}."
+        return f"Language swapped to {code}. You MUST now answer the user's question in {code} without mentioning the language swap."
 
 
 class GreeterAgent(BaseMayaAgent):
     """Greets the caller in English and detects their language."""
 
-    def __init__(self) -> None:
-        super().__init__(instructions=GREETER_INSTRUCTIONS)
+    def __init__(self, persona: str, agent_row: dict) -> None:
+        self.persona = persona
+        self.agent_row = agent_row
+        instructions = (
+            persona
+            + "\n\nCRITICAL: Do NOT ask the caller which language they prefer. "
+            "Automatically detect their language based on their speech. If they speak "
+            "Hindi, immediately call set_language('hi'). If they speak English, "
+            "immediately call set_language('en'). Do not dive into property questions "
+            "before the language is set. IMPORTANT: Do NOT use the search_knowledge tool "
+            "until you have successfully called set_language."
+        )
+        super().__init__(instructions=instructions)
 
 
 class LangAgent(BaseMayaAgent):
     """One agent parameterised by language code; STT + TTS locked to it."""
 
-    def __init__(self, code: str) -> None:
+    def __init__(self, code: str, persona: str, agent_row: dict) -> None:
+        self.code = code
+        self.persona = persona
+        self.agent_row = agent_row
         bcp47 = BCP47[code]
         super().__init__(
-            instructions=build_instructions(code, STYLE_NOTES[code]),
-            # Override the session's STT/TTS to relock the language for this agent.
+            instructions=build_instructions(code, STYLE_NOTES[code], persona),
             stt=sarvam.STT(
                 model=SARVAM_STT_MODEL,
                 mode="codemix",
@@ -214,20 +191,15 @@ class LangAgent(BaseMayaAgent):
                 target_language_code=bcp47,
                 speaker=SARVAM_TTS_VOICE,
                 pace=1.10,
-		min_buffer_size=30,
-    		max_chunk_length=80,
+                min_buffer_size=30,
+                max_chunk_length=80,
             ),
         )
-        self.code = code
 
 
-# --- metrics -> JSONL --------------------------------------------------------
 def _make_metrics_handler(call_id: str):
-    """Build a metrics_collected handler that logs per-stage latency as JSONL."""
-
     def _on_metrics(ev: MetricsCollectedEvent) -> None:
         m = ev.metrics
-        # Pull the one latency number that matters per stage.
         if isinstance(m, metrics.EOUMetrics):
             row = {"stage": "eou", "seconds": m.end_of_utterance_delay, "speech_id": m.speech_id}
         elif isinstance(m, metrics.STTMetrics):
@@ -245,22 +217,16 @@ def _make_metrics_handler(call_id: str):
             METRICS_LOG.parent.mkdir(parents=True, exist_ok=True)
             with METRICS_LOG.open("a", encoding="utf-8") as f:
                 f.write(json.dumps(row, ensure_ascii=False) + "\n")
-        except Exception:  # never let metrics logging break a live call
+        except Exception:
             log.exception("failed to write metrics row")
-        metrics.log_metrics(m)  # also to the console log
+        metrics.log_metrics(m)
 
     return _on_metrics
 
 
-# --- entrypoint --------------------------------------------------------------
 async def entrypoint(ctx: JobContext) -> None:
-    import asyncio
-    import concurrent.futures
-    loop = asyncio.get_running_loop()
-    loop.set_default_executor(concurrent.futures.ThreadPoolExecutor(max_workers=200))
     await ctx.connect()
 
-    # Try to extract phone from room name or metadata
     phone = None
     if ctx.room.metadata and "+" in ctx.room.metadata:
         phone = ctx.room.metadata
@@ -269,33 +235,48 @@ async def entrypoint(ctx: JobContext) -> None:
         
     start_time = time.time()
 
-    # Create one Supabase record for this call.
-    call_id = await create_call(
-        livekit_room=ctx.room.name,
-        phone=phone,
-        language=DEFAULT_LANGUAGE,
-    )
+    # Determine DID from metadata or room name. 
+    did = phone if phone else None
+    
+    if did:
+        agent_row = await get_agent_by_did(did)
+    else:
+        # If testing via LiveKit Sandbox or Console without a phone number, 
+        # fallback to any available live agent so testing still works!
+        agent_row = await get_default_agent()
+        log.info("No DID found in room. Falling back to default live agent: %s", 
+                 agent_row["agent_name"] if agent_row else "None")
 
-    log.info(
-        "Supabase call created: %s for room %s",
-        call_id,
-        ctx.room.name,
-    )
+    if agent_row is None or agent_row["status"] != "live":
+        await ctx.room.local_participant.publish_data(b"unavailable")
+        ctx.shutdown(reason="no live agent for this number")
+        return
+
+    persona = build_persona(agent_row)
+    call_id = str(uuid.uuid4())
+    
+    import asyncio
+    call_task = asyncio.create_task(create_call(
+        call_id=call_id,
+        livekit_room=ctx.room.name,
+        agent_id=agent_row["id"],
+        phone=phone,
+        language=agent_row["default_language"],
+    ))
 
     session = _build_session(
-        DEFAULT_LANGUAGE,
+        agent_row["default_language"],
         ctx,
         call_id,
+        agent_row["id"],
     )
     session.on(
         "metrics_collected",
         _make_metrics_handler(ctx.room.name),
     )
 
-    # Save customer and Maya messages.
     def on_conversation_item(event) -> None:
         item = event.item
-
         role = getattr(item, "role", None)
         text = getattr(item, "raw_text_content", None)
 
@@ -311,14 +292,13 @@ async def entrypoint(ctx: JobContext) -> None:
 
         async def _do_save():
             try:
+                await call_task
                 await save_message(
                     call_id=call_id,
                     speaker=speaker,
                     message=text,
                 )
-                log.info("Saved %s message", speaker)
             except Exception:
-                # Never allow database issues to break the live call.
                 log.exception("Failed to save conversation message")
                 
         import asyncio
@@ -329,45 +309,42 @@ async def entrypoint(ctx: JobContext) -> None:
         on_conversation_item,
     )
 
-    # This runs when the LiveKit job shuts down.
     async def on_shutdown(reason: str = "") -> None:
         try:
             duration_seconds = int(time.time() - start_time)
             await finish_call(call_id, duration_seconds)
-            log.info(
-                "Supabase call finished: %s reason=%s",
-                call_id,
-                reason,
-            )
         except Exception:
             log.exception("Failed to finish Supabase call")
 
     ctx.add_shutdown_callback(on_shutdown)
 
     await session.start(
-        agent=GreeterAgent(),
+        agent=GreeterAgent(persona, agent_row),
         room=ctx.room,
     )
 
-    # Save Maya's opening greeting.
+    greeting = GREETINGS.get(agent_row["default_language"], GREETINGS["en"]).format(
+        company_name=agent_row["company_name"],
+        agent_name=agent_row["agent_name"]
+    )
+    await session.say(greeting)
+
     try:
+        await call_task
         await save_message(
             call_id=call_id,
             speaker="maya",
-            message=GREETINGS[DEFAULT_LANGUAGE],
+            message=greeting,
         )
     except Exception:
         log.exception("Failed to save opening greeting")
-
-    await session.say(
-        GREETINGS[DEFAULT_LANGUAGE]
-    )
 
 
 if __name__ == "__main__":
     agents.cli.run_app(
         WorkerOptions(
             entrypoint_fnc=entrypoint,
+            prewarm_fnc=prewarm,
             agent_name=os.getenv("AGENT_NAME", "maya"),
         )
     )
