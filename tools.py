@@ -1,4 +1,4 @@
-"""Function tools for Maya, the Zryth AI solutions voice assistant."""
+"""Function tools AI solutions voice assistant."""
 
 from __future__ import annotations
 
@@ -23,6 +23,8 @@ else:
     llm_client = genai.Client(api_key=os.getenv("GOOGLE_API_KEY"))
 
 log = logging.getLogger("voice-agent.tools")
+
+_cached_db = None
 
 DATA_DIR = Path(__file__).parent / "data"
 LEADS_PATH = DATA_DIR / "leads.json"
@@ -131,33 +133,36 @@ class AppointmentTools:
         log.info(f"search_knowledge -> querying for: {query}")
         
         try:
-            # 1 & 2. Embed the query and query Supabase off the main thread
             def _do_search():
                 res = llm_client.models.embed_content(
                     model='gemini-embedding-2',
                     contents=query,
                 )
                 emb = res.embeddings[0].values
-                return _init_supabase().rpc(
-                    'match_knowledge', 
-                    {
-                        'query_embedding': emb, 
-                        'match_threshold': 0.45, 
-                        'match_count': 5
-                    }
-                ).execute()
                 
-            rpc_response = await asyncio.to_thread(_do_search)
+                # Check globally initialized db connection instead of reconnecting every time
+                global _cached_db
+                if _cached_db is None:
+                    import lancedb
+                    import os
+                    if not os.path.exists("data/lancedb"):
+                        return []
+                    _cached_db = lancedb.connect("data/lancedb")
+                
+                db = _cached_db
+                if "knowledge" not in db.table_names():
+                    return []
+                    
+                table = db.open_table("knowledge")
+                results = table.search(emb).limit(5).to_list()
+                return [row['content'] for row in results]
+                
+            results_content = await asyncio.to_thread(_do_search)
             
-            # 3. Format results
-            if not rpc_response.data:
+            if not results_content:
                 return "No relevant information found in the knowledge base."
                 
-            results = []
-            for row in rpc_response.data:
-                results.append(row['content'])
-                
-            formatted_results = "\n\n".join(results)
+            formatted_results = "\n\n".join(results_content)
             return f"{formatted_results}\n\nCRITICAL: You MUST now respond to the user with a very brief spoken summary of this information. DO NOT call any further tools."
             
         except Exception as e:

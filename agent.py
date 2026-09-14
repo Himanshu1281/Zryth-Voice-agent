@@ -79,7 +79,13 @@ from prompts import (
 )
 from tools import AppointmentTools
 
-from database import create_call, save_message, finish_call
+from database import (
+    create_call, 
+    save_message, 
+    finish_call, 
+    sync_knowledge_to_lancedb, 
+    auto_sync_loop
+)
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("voice-agent")
@@ -129,6 +135,13 @@ def _build_session(
                 base_url="https://api.groq.com/openai/v1",
                 temperature=LLM_TEMPERATURE,
                 max_completion_tokens=MAX_TOKENS,  # cap reply length -> lower latency
+            ),
+            openai.LLM(
+                model="openai/gpt-oss-20b",
+                api_key=GROQ_API_KEY,
+                base_url="https://api.groq.com/openai/v1",
+                temperature=LLM_TEMPERATURE,
+                max_completion_tokens=MAX_TOKENS,
             ),
             openai.LLM(
                 model="openai/gpt-oss-safeguard-20b",
@@ -357,6 +370,17 @@ async def entrypoint(ctx: JobContext) -> None:
 
 
 if __name__ == "__main__":
+    log.info("Performing initial LanceDB sync...")
+    sync_knowledge_to_lancedb()
+    
+    import threading
+    def _run_sync_loop():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(auto_sync_loop())
+        
+    threading.Thread(target=_run_sync_loop, daemon=True).start()
+
     agents.cli.run_app(
         WorkerOptions(
             entrypoint_fnc=entrypoint,

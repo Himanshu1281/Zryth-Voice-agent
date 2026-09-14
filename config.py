@@ -40,7 +40,7 @@ SARVAM_TTS_VOICE = os.getenv("SARVAM_TTS_VOICE", "simran")
 # --- Google Gemini (LLM) ------------------------------------------------------------
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
-LLM_MODEL = os.getenv("LLM_MODEL", "openai/gpt-oss-20b")
+LLM_MODEL = os.getenv("LLM_MODEL", "llama3-8b-8192")
 LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.3"))
 # Hard cap on reply length. Short replies = lower TTS/LLM latency on a phone call.
 MAX_TOKENS = int(os.getenv("MAX_TOKENS", "150"))
@@ -61,7 +61,7 @@ VAD_MIN_SPEECH_DURATION = float(os.getenv("VAD_MIN_SPEECH_DURATION", "0.3"))
 # Endpointing window (how long to wait for the caller to resume before treating
 # the turn as finished). Tuned tight for snappy phone turns.
 MIN_ENDPOINTING_DELAY = float(os.getenv("MIN_ENDPOINTING_DELAY", "0.15"))
-MAX_ENDPOINTING_DELAY = float(os.getenv("MAX_ENDPOINTING_DELAY", "0.6"))
+MAX_ENDPOINTING_DELAY = float(os.getenv("MAX_ENDPOINTING_DELAY", "0.5"))
 
 # Telephony sample rate. 8 kHz end-to-end is the latency recipe for phone audio.
 AUDIO_SAMPLE_RATE = 8000

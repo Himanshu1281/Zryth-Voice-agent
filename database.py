@@ -6,7 +6,12 @@ from typing import Optional
 
 from dotenv import load_dotenv
 from supabase import Client, create_client
+import json
+import asyncio
+import logging
+import lancedb
 
+log = logging.getLogger(__name__)
 
 load_dotenv()
 
@@ -120,6 +125,61 @@ def finish_call(call_id: str, duration_seconds: int = 0) -> None:
         .eq("id", call_id)
         .execute()
     )
+
+
+def sync_knowledge_to_lancedb() -> None:
+    """Sync Supabase knowledge base to local LanceDB."""
+    try:
+        response = _init_supabase().table("zryth_knowledge").select("id, content, embedding").execute()
+        data = response.data
+        if not data:
+            log.info("No data in Supabase zryth_knowledge to sync.")
+            return
+
+        lancedb_data = []
+        for row in data:
+            try:
+                # Supabase returns the pgvector as a string, e.g. "[0.1, 0.2, ...]"
+                vec = json.loads(row['embedding'])
+                lancedb_data.append({
+                    "id": row['id'],
+                    "content": row['content'],
+                    "vector": vec
+                })
+            except Exception as e:
+                log.warning(f"Failed to parse embedding for row {row['id']}: {e}")
+
+        if lancedb_data:
+            os.makedirs("data", exist_ok=True)
+            db = lancedb.connect("data/lancedb")
+            db.create_table("knowledge", data=lancedb_data, mode="overwrite")
+            log.info(f"Successfully synced {len(lancedb_data)} rows to local LanceDB.")
+            
+    except Exception as e:
+        log.error(f"Error syncing knowledge to LanceDB: {e}")
+
+
+async def auto_sync_loop() -> None:
+    """Background task to periodically sync LanceDB with Supabase."""
+    while True:
+        await asyncio.sleep(60)
+        try:
+            # Check Supabase count
+            res = _init_supabase().table("zryth_knowledge").select("id", count="exact").limit(1).execute()
+            supa_count = res.count
+            
+            # Check LanceDB count
+            local_count = 0
+            if os.path.exists("data/lancedb"):
+                db = lancedb.connect("data/lancedb")
+                if "knowledge" in db.table_names():
+                    local_count = len(db.open_table("knowledge").search().limit(None).to_list()) # count_rows() can be unreliable in some lancedb versions, this is safer for small tables
+            
+            if supa_count != local_count:
+                log.info(f"Sync required! Supabase has {supa_count} rows, LanceDB has {local_count}.")
+                await asyncio.to_thread(sync_knowledge_to_lancedb)
+        except Exception as e:
+            log.error(f"Error in auto_sync_loop: {e}")
 
 
 if __name__ == "__main__":
