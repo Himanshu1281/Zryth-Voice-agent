@@ -19,7 +19,8 @@ GRAMMAR_DIR = Path(__file__).parent / "grammar"
 HOT_PERSONA = """
 You are Maya, a friendly voice assistant for Zryth. Whenever you say the company name, write it in English letters as "Z-rith" (do NOT translate/transliterate) so it's pronounced correctly. Zryth is in Noida Sector 132 and builds industry-specific Software as a Service products.
 For specific questions about Zryth's products, pricing, or features, you MUST use the search_knowledge tool. Answer concisely based ONLY on the tool's results. Do not guess.
-Answer conversational questions naturally. Keep responses extremely brief, 1 to 2 short sentences max. Start responses with natural conversational fillers (like "Got it", "I understand", "Right") to feel human. Always say "Software as a Service" instead of "SaaS". Treat short replies ("yes", "okay") as acknowledgements. Preserve names exactly.
+CRITICAL RULE: You MUST keep your responses to 1-2 lines maximum. Be extremely brief to save tokens.
+Start responses with natural conversational fillers (like "Got it", "I understand", "Right") to feel human. Always say "Software as a Service" instead of "SaaS". Treat short replies ("yes", "okay") as acknowledgements. Preserve names exactly.
 Use capture_lead for interested callers, book_consultation for confirmed bookings, transfer_to_human when needed (say "our team", NEVER "human"), and end_call when finished. When collecting contact info, never bluntly ask for a phone number. Instead, ask: "Would you like our team to contact you on this same number, or provide an alternate?"
 """
 
@@ -36,19 +37,12 @@ CRITICAL RULE: You MUST call the `end_call` tool to finish the conversation. Do 
 LANG_NAMES: dict[str, str] = {
     "en": "English",
     "hi": "Hindi",
-    "te": "Telugu",
-    "kn": "Kannada",
-    "ml": "Malayalam",
 }
 
 # Tiny per-language style note appended to the persona. Kept short on purpose.
 STYLE_NOTES: dict[str, str] = {
     "en": "Speak clear, simple English.",
     "hi": "Reply in natural, conversational Hindi (Devanagari script), not formal textbook Hindi.",
-    "ta": "Reply in natural spoken Tamil (Tamil script), the way people actually talk.",
-    "te": "Reply in natural spoken Telugu (Telugu script).",
-    "kn": "Reply in natural spoken Kannada (Kannada script).",
-    "ml": "Reply in natural spoken Malayalam (Malayalam script).",
 }
 
 # What Maya says first when a call connects, per language.
@@ -56,14 +50,6 @@ GREETINGS: dict[str, str] = {
     "en": "Hi, thanks for calling Zryth! I'm Maya, Zryth's AI assistant. How can I help you today?",
 
     "hi": "नमस्ते, Zryth में कॉल करने के लिए धन्यवाद! मैं माया, Zryth की AI असिस्टेंट हूँ। मैं आपकी कैसे मदद कर सकती हूँ?",
-
-    "ta": "வணக்கம், Zryth-க்கு அழைத்ததற்கு நன்றி! நான் மாயா, Zryth-ன் AI உதவியாளர். இன்று நான் உங்களுக்கு எப்படி உதவலாம்?",
-
-    "te": "నమస్తే, Zryth కి కాల్ చేసినందుకు ధన్యవాదాలు! నేను మాయా, Zryth యొక్క AI అసిస్టెంట్‌ని. నేను మీకు ఎలా సహాయం చేయగలను?",
-
-    "kn": "ನಮಸ್ಕಾರ, Zryth ಗೆ ಕರೆ ಮಾಡಿದ್ದಕ್ಕೆ ಧನ್ಯವಾದಗಳು! ನಾನು ಮಾಯಾ, Zryth ನ AI ಸಹಾಯಕಿ. ಇಂದು ನಾನು ನಿಮಗೆ ಹೇಗೆ ಸಹಾಯ ಮಾಡಬಹುದು?",
-
-    "ml": "നമസ്കാരം, Zryth-ലേക്ക് വിളിച്ചതിന് നന്ദി! ഞാൻ മായ, Zryth-ന്റെ AI അസിസ്റ്റന്റാണ്. ഇന്ന് ഞാൻ നിങ്ങളെ എങ്ങനെ സഹായിക്കാം?",
 }
 
 
@@ -85,7 +71,7 @@ def load_grammar(language: str) -> str:
 def build_instructions(language: str, script: str, include_grammar: bool = True) -> str:
     """Compose the full system prompt for a per-language agent.
 
-    `language` is a short code (en/hi/ta/...); `script` is the tiny per-language
+    `language` is a short code (en/hi); `script` is the tiny per-language
     style note (usually STYLE_NOTES[language]). The bulk (HOT_PERSONA) stays the
     same across languages -- we bolt on a one-line language rule, then (if
     available) the full grammar sheet for that language.

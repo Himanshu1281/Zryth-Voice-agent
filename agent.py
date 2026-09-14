@@ -1,4 +1,4 @@
-"""Maya -- the Acme Realty inbound voice agent (LiveKit Agents worker).
+"""inbound AI voice agent (LiveKit Agents worker).
 
 Run it:
     python agent.py start          # register with LiveKit and take calls
@@ -15,6 +15,7 @@ that language. See GreeterAgent.set_language for the (important) silent-swap fix
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -47,7 +48,8 @@ from livekit.agents import (
     function_tool,
     metrics,
 )
-from livekit.plugins import google, sarvam, silero
+from livekit.agents.llm import FallbackAdapter
+from livekit.plugins import google, openai, sarvam, silero
 
 from config import (
     AGENT_NAME,
@@ -58,6 +60,7 @@ from config import (
     MAX_TOKENS,
     MIN_ENDPOINTING_DELAY,
     GOOGLE_API_KEY,
+    GROQ_API_KEY,
     LLM_MODEL,
     LLM_TEMPERATURE,
     SARVAM_STT_MODEL,
@@ -90,10 +93,6 @@ METRICS_LOG = Path(__file__).parent / "logs" / "metrics.jsonl"
 CONFIRMATIONS: dict[str, str] = {
     "en": "Perfect, we'll continue in English.",
     "hi": "ठीक है, अब हम हिंदी में बात करेंगे।",
-    "ta": "சரி, இனி நாம் தமிழில் பேசுவோம்.",
-    "te": "సరే, ఇప్పటి నుండి మనం తెలుగులో మాట్లాడుకుందాం.",
-    "kn": "ಸರಿ, ಇನ್ನು ನಾವು ಕನ್ನಡದಲ್ಲಿ ಮಾತನಾಡೋಣ.",
-    "ml": "ശരി, ഇനി നമുക്ക് മലയാളത്തിൽ സംസാരിക്കാം.",
 }
 
 
@@ -123,12 +122,22 @@ def _build_session(
             language=bcp47,
             sample_rate=AUDIO_SAMPLE_RATE,  # 8 kHz telephony
         ),
-        llm=google.LLM(
-            model=LLM_MODEL,
-            api_key=GOOGLE_API_KEY,        # gemini-2.5-flash-lite
-            temperature=LLM_TEMPERATURE,
-            max_output_tokens=MAX_TOKENS,  # cap reply length -> lower latency
-        ),
+        llm=FallbackAdapter([
+            openai.LLM(
+                model=LLM_MODEL,
+                api_key=GROQ_API_KEY,
+                base_url="https://api.groq.com/openai/v1",
+                temperature=LLM_TEMPERATURE,
+                max_completion_tokens=MAX_TOKENS,  # cap reply length -> lower latency
+            ),
+            openai.LLM(
+                model="openai/gpt-oss-safeguard-20b",
+                api_key=GROQ_API_KEY,
+                base_url="https://api.groq.com/openai/v1",
+                temperature=LLM_TEMPERATURE,
+                max_completion_tokens=MAX_TOKENS,
+            )
+        ]),
         tts=sarvam.TTS(
             model=SARVAM_TTS_MODEL,        # bulbul:v3
             target_language_code=bcp47,
@@ -151,10 +160,9 @@ def _build_session(
 # --- agents ------------------------------------------------------------------
 GREETER_INSTRUCTIONS = (
     HOT_PERSONA
-    + "\n\nYou are greeting the caller in English. Listen for the language they "
-    "speak or ask for. The moment you know it, call the set_language tool with the "
-    "code (en, hi, ta, te, kn, ml). Do not dive into property questions before the "
-    "language is set."
+    + "\n\nYou are speaking with the caller in English. Answer their questions normally. "
+    "If they speak or ask for a different language, immediately call the set_language tool with the "
+    "code (en, hi)."
 )
 
 
@@ -166,25 +174,18 @@ class BaseMayaAgent(Agent):
         """Switch the whole conversation to the caller's preferred language.
 
         Args:
-            language: one of en, hi, ta, te, kn, ml.
-        """
+            language: one of en, hi.
+        """     
         code = language.strip().lower()
         if code not in SUPPORTED_LANGUAGES:
             # Don't swap on an unknown code -- tell the LLM so it can re-ask.
             return f"Language '{language}' is not supported. Supported: {', '.join(SUPPORTED_LANGUAGES)}."
 
-        # ---------------------------------------------------------------------
-        # WHY we speak BEFORE swapping (do NOT reorder):
-        # session.update_agent() swaps the active agent SILENTLY -- the new
-        # agent does NOT automatically say anything. If we swap first and expect
-        # the new LangAgent to greet, the call goes to DEAD AIR. That was a real,
-        # painful production bug. So we emit the confirmation on the CURRENT
-        # session first, THEN swap.
-        # ---------------------------------------------------------------------
-        await context.session.say(CONFIRMATIONS[code])
+        # Swap to the new language agent so TTS uses the native language model
         context.session.update_agent(LangAgent(code))
-        # We already voiced the confirmation, so return nothing (no extra reply).
-        return None
+        
+        # Return instructions to the LLM so it generates an answer to the user's question
+        return f"Language successfully switched to {code}. You MUST now answer the user's previous question naturally in {code} without saying 'language switched' or acknowledging the switch. CRITICAL: You MUST respond with spoken text now. DO NOT call any further tools."
 
 
 class GreeterAgent(BaseMayaAgent):
@@ -265,7 +266,8 @@ async def entrypoint(ctx: JobContext) -> None:
     start_time = time.time()
 
     # Create one Supabase record for this call.
-    call_id = create_call(
+    call_id = await asyncio.to_thread(
+        create_call,
         livekit_room=ctx.room.name,
         phone=phone,
         language=DEFAULT_LANGUAGE,
@@ -304,17 +306,15 @@ async def entrypoint(ctx: JobContext) -> None:
         else:
             return
 
-        try:
-            save_message(
-                call_id=call_id,
-                speaker=speaker,
-                message=text,
-            )
-            log.info("Saved %s message", speaker)
-
-        except Exception:
-            # Never allow database issues to break the live call.
-            log.exception("Failed to save conversation message")
+        async def _save():
+            try:
+                await asyncio.to_thread(save_message, call_id, speaker, text)
+                log.info("Saved %s message", speaker)
+            except Exception:
+                # Never allow database issues to break the live call.
+                log.exception("Failed to save conversation message")
+        
+        asyncio.create_task(_save())
 
     session.on(
         "conversation_item_added",
@@ -325,7 +325,7 @@ async def entrypoint(ctx: JobContext) -> None:
     async def on_shutdown(reason: str = "") -> None:
         try:
             duration_seconds = int(time.time() - start_time)
-            finish_call(call_id, duration_seconds)
+            await asyncio.to_thread(finish_call, call_id, duration_seconds)
             log.info(
                 "Supabase call finished: %s reason=%s",
                 call_id,

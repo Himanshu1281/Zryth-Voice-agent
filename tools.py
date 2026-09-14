@@ -14,7 +14,7 @@ from google import genai
 from livekit.agents import JobContext, RunContext, function_tool
 
 from config import DEFAULT_TRANSFER_NUMBER
-from database import supabase, update_call_lead
+from database import _init_supabase, update_call_lead
 
 # Initialize the Gemini client for embeddings
 if os.getenv('CI') or os.getenv('GITHUB_ACTIONS'):
@@ -97,7 +97,8 @@ class AppointmentTools:
         """
 
         if self.call_id:
-            update_call_lead(
+            await asyncio.to_thread(
+                update_call_lead,
                 call_id=self.call_id,
                 customer_name=name,
                 phone=phone,
@@ -130,22 +131,23 @@ class AppointmentTools:
         log.info(f"search_knowledge -> querying for: {query}")
         
         try:
-            # 1. Embed the query
-            response = llm_client.models.embed_content(
-                model='gemini-embedding-001',
-                contents=query,
-            )
-            embedding = response.embeddings[0].values
-            
-            # 2. Query Supabase
-            rpc_response = supabase.rpc(
-                'match_knowledge', 
-                {
-                    'query_embedding': embedding, 
-                    'match_threshold': 0.45, 
-                    'match_count': 5
-                }
-            ).execute()
+            # 1 & 2. Embed the query and query Supabase off the main thread
+            def _do_search():
+                res = llm_client.models.embed_content(
+                    model='gemini-embedding-2',
+                    contents=query,
+                )
+                emb = res.embeddings[0].values
+                return _init_supabase().rpc(
+                    'match_knowledge', 
+                    {
+                        'query_embedding': emb, 
+                        'match_threshold': 0.45, 
+                        'match_count': 5
+                    }
+                ).execute()
+                
+            rpc_response = await asyncio.to_thread(_do_search)
             
             # 3. Format results
             if not rpc_response.data:
@@ -155,7 +157,8 @@ class AppointmentTools:
             for row in rpc_response.data:
                 results.append(row['content'])
                 
-            return "\n\n".join(results)
+            formatted_results = "\n\n".join(results)
+            return f"{formatted_results}\n\nCRITICAL: You MUST now respond to the user with a very brief spoken summary of this information. DO NOT call any further tools."
             
         except Exception as e:
             log.error(f"search_knowledge error: {e}")
@@ -190,7 +193,8 @@ class AppointmentTools:
         """
 
         if self.call_id:
-            update_call_lead(
+            await asyncio.to_thread(
+                update_call_lead,
                 call_id=self.call_id,
                 customer_name=name,
                 phone=phone,

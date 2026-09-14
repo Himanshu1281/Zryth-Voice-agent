@@ -39,7 +39,8 @@ SARVAM_TTS_VOICE = os.getenv("SARVAM_TTS_VOICE", "simran")
 
 # --- Google Gemini (LLM) ------------------------------------------------------------
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
-LLM_MODEL = os.getenv("LLM_MODEL", "gemini-2.5-flash-lite")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
+LLM_MODEL = os.getenv("LLM_MODEL", "openai/gpt-oss-20b")
 LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.3"))
 # Hard cap on reply length. Short replies = lower TTS/LLM latency on a phone call.
 MAX_TOKENS = int(os.getenv("MAX_TOKENS", "150"))
@@ -54,8 +55,8 @@ VAD_MIN_SILENCE_MS = int(os.getenv("VAD_MIN_SILENCE_MS", "250"))
 VAD_MIN_SILENCE_S = VAD_MIN_SILENCE_MS / 1000.0
 
 # VAD thresholds to prevent background noise from interrupting Maya.
-VAD_ACTIVATION_THRESHOLD = float(os.getenv("VAD_ACTIVATION_THRESHOLD", "0.7"))
-VAD_MIN_SPEECH_DURATION = float(os.getenv("VAD_MIN_SPEECH_DURATION", "0.15"))
+VAD_ACTIVATION_THRESHOLD = float(os.getenv("VAD_ACTIVATION_THRESHOLD", "0.8"))
+VAD_MIN_SPEECH_DURATION = float(os.getenv("VAD_MIN_SPEECH_DURATION", "0.3"))
 
 # Endpointing window (how long to wait for the caller to resume before treating
 # the turn as finished). Tuned tight for snappy phone turns.
@@ -76,9 +77,6 @@ DEFAULT_TRANSFER_NUMBER = os.getenv("DEFAULT_TRANSFER_NUMBER", "+91XXXXXXXXXX")
 BCP47: dict[str, str] = {
     "en": "en-IN",
     "hi": "hi-IN",
-    "ta": "ta-IN",
-    "te": "te-IN",
-    "kn": "kn-IN",
-    "ml": "ml-IN",
+   
 }
 SUPPORTED_LANGUAGES: list[str] = list(BCP47.keys())

@@ -248,8 +248,7 @@ Deploy the same way, dial your number, done.
 
 ## 🙏 Credits
 
-Open-sourced by **Dinakar Selvakumar**. Built on the excellent work of the
-LiveKit, Sarvam, and n8n communities.
+
 
 Licensed under the **MIT License** — see [`LICENSE`](LICENSE). Use it, fork it,
 ship it.
