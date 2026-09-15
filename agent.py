@@ -84,7 +84,7 @@ from database import (
     save_message, 
     finish_call, 
     sync_knowledge_to_lancedb, 
-    auto_sync_loop
+    realtime_sync_loop
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -378,7 +378,7 @@ if __name__ == "__main__":
     def _run_sync_loop():
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-        loop.run_until_complete(auto_sync_loop())
+        loop.run_until_complete(realtime_sync_loop())
         
     threading.Thread(target=_run_sync_loop, daemon=True).start()
 

@@ -158,27 +158,56 @@ def sync_knowledge_to_lancedb() -> None:
         log.error(f"Error syncing knowledge to LanceDB: {e}")
 
 
-async def auto_sync_loop() -> None:
-    """Background task to periodically sync LanceDB with Supabase."""
+sync_queue = asyncio.Queue()
+
+def _realtime_callback(payload):
+    """Callback for Supabase Realtime events."""
+    try:
+        loop = asyncio.get_running_loop()
+        loop.call_soon_threadsafe(sync_queue.put_nowait, True)
+    except Exception as e:
+        # If no running loop, log or ignore
+        log.warning(f"Could not queue sync event: {e}")
+
+async def realtime_sync_loop() -> None:
+    """Background task to sync LanceDB via Supabase Realtime with debouncing."""
+    try:
+        supabase_client = _init_supabase()
+        
+        # Subscribe to changes
+        channel = supabase_client.channel("zryth_knowledge_changes")
+        channel.on(
+            "postgres_changes", 
+            event="*", 
+            schema="public", 
+            table="zryth_knowledge", 
+            callback=_realtime_callback
+        )
+        channel.subscribe()
+        log.info("Subscribed to Supabase Realtime for zryth_knowledge table.")
+    except Exception as e:
+        log.error(f"Failed to subscribe to Realtime: {e}")
+        return
+
     while True:
-        await asyncio.sleep(60)
+        # Wait until an event is pushed to the queue
+        await sync_queue.get()
+        
+        # Debounce: Wait 5 seconds to gather any subsequent rapid events
+        await asyncio.sleep(5)
+        
+        # Clear the queue of any additional events that arrived during the wait
+        while not sync_queue.empty():
+            try:
+                sync_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+                
+        log.info("Sync required! Changes detected via Realtime.")
         try:
-            # Check Supabase count
-            res = _init_supabase().table("zryth_knowledge").select("id", count="exact").limit(1).execute()
-            supa_count = res.count
-            
-            # Check LanceDB count
-            local_count = 0
-            if os.path.exists("data/lancedb"):
-                db = lancedb.connect("data/lancedb")
-                if "knowledge" in db.table_names():
-                    local_count = len(db.open_table("knowledge").search().limit(None).to_list()) # count_rows() can be unreliable in some lancedb versions, this is safer for small tables
-            
-            if supa_count != local_count:
-                log.info(f"Sync required! Supabase has {supa_count} rows, LanceDB has {local_count}.")
-                await asyncio.to_thread(sync_knowledge_to_lancedb)
+            await asyncio.to_thread(sync_knowledge_to_lancedb)
         except Exception as e:
-            log.error(f"Error in auto_sync_loop: {e}")
+            log.error(f"Error syncing after realtime event: {e}")
 
 if __name__ == "__main__":
     print("Testing Supabase connection...")
