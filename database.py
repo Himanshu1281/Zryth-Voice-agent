@@ -171,19 +171,19 @@ def _realtime_callback(payload):
 
 async def realtime_sync_loop() -> None:
     """Background task to sync LanceDB via Supabase Realtime with debouncing."""
+    from supabase import create_async_client
     try:
-        supabase_client = _init_supabase()
+        supabase_async = await create_async_client(SUPABASE_URL, SUPABASE_SECRET_KEY)
         
         # Subscribe to changes
-        channel = supabase_client.channel("zryth_knowledge_changes")
-        channel.on(
-            "postgres_changes", 
+        channel = supabase_async.channel("zryth_knowledge_changes")
+        channel.on_postgres_changes(
             event="*", 
             schema="public", 
             table="zryth_knowledge", 
             callback=_realtime_callback
         )
-        channel.subscribe()
+        await channel.subscribe()
         log.info("Subscribed to Supabase Realtime for zryth_knowledge table.")
     except Exception as e:
         log.error(f"Failed to subscribe to Realtime: {e}")
