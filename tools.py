@@ -145,9 +145,10 @@ class AppointmentTools:
                 if _cached_db is None:
                     import lancedb
                     import os
-                    if not os.path.exists("data/lancedb"):
+                    from database import LANCEDB_PATH
+                    if not os.path.exists(LANCEDB_PATH):
                         return []
-                    _cached_db = lancedb.connect("data/lancedb")
+                    _cached_db = lancedb.connect(LANCEDB_PATH)
 
                 db = _cached_db
                 if "knowledge" not in db.table_names():

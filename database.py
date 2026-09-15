@@ -10,10 +10,16 @@ import json
 import asyncio
 import logging
 import lancedb
+import threading
 
 log = logging.getLogger(__name__)
 
 load_dotenv()
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+LANCEDB_PATH = os.path.join(BASE_DIR, "data", "lancedb")
+
+_lancedb_sync_lock = threading.Lock()
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_SECRET_KEY = os.getenv("SUPABASE_SECRET_KEY")
@@ -148,34 +154,77 @@ def finish_call(call_id: str, duration_seconds: int = 0) -> None:
 
 def sync_knowledge_to_lancedb() -> None:
     """Sync Supabase knowledge base to local LanceDB."""
+
+    if not _lancedb_sync_lock.acquire(blocking=False):
+        log.info("LanceDB sync already in progress. Skipping duplicate sync.")
+        return
+
     try:
-        response = _init_supabase().table("zryth_knowledge").select("id, content, embedding").execute()
+        response = (
+            _init_supabase()
+            .table("zryth_knowledge")
+            .select("id, content, embedding")
+            .execute()
+        )
+
         data = response.data
+
         if not data:
             log.info("No data in Supabase zryth_knowledge to sync.")
             return
 
         lancedb_data = []
+
         for row in data:
             try:
-                # Supabase returns the pgvector as a string, e.g. "[0.1, 0.2, ...]"
-                vec = json.loads(row['embedding'])
-                lancedb_data.append({
-                    "id": row['id'],
-                    "content": row['content'],
-                    "vector": vec
-                })
-            except Exception as e:
-                log.warning(f"Failed to parse embedding for row {row['id']}: {e}")
+                vec = json.loads(row["embedding"])
 
-        if lancedb_data:
-            os.makedirs("data", exist_ok=True)
-            db = lancedb.connect("data/lancedb")
-            db.create_table("knowledge", data=lancedb_data, mode="overwrite")
-            log.info(f"Successfully synced {len(lancedb_data)} rows to local LanceDB.")
-            
+                lancedb_data.append(
+                    {
+                        "id": row["id"],
+                        "content": row["content"],
+                        "vector": vec,
+                    }
+                )
+
+            except Exception as e:
+                log.warning(
+                    f"Failed to parse embedding for row "
+                    f"{row['id']}: {e}"
+                )
+
+        if not lancedb_data:
+            log.warning("No valid knowledge rows to write to LanceDB.")
+            return
+
+        os.makedirs(LANCEDB_PATH, exist_ok=True)
+
+        log.info(
+            "Synchronizing %d rows to LanceDB at %s...",
+            len(lancedb_data),
+            LANCEDB_PATH,
+        )
+
+        db = lancedb.connect(LANCEDB_PATH)
+
+        db.create_table(
+            "knowledge",
+            data=lancedb_data,
+            mode="overwrite",
+        )
+
+        log.info(
+            "Successfully synced %d rows to local LanceDB.",
+            len(lancedb_data),
+        )
+
     except Exception as e:
-        log.error(f"Error syncing knowledge to LanceDB: {e}")
+        log.exception(
+            f"Error syncing knowledge to LanceDB: {e}"
+        )
+
+    finally:
+        _lancedb_sync_lock.release()
 
 
 async def realtime_sync_loop() -> None:
