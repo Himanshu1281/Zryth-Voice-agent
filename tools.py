@@ -24,6 +24,8 @@ else:
 
 log = logging.getLogger("voice-agent.tools")
 
+_cached_db = None
+
 DATA_DIR = Path(__file__).parent / "data"
 LEADS_PATH = DATA_DIR / "leads.json"
 
@@ -137,15 +139,23 @@ class AppointmentTools:
                     contents=query,
                 )
                 emb = res.embeddings[0].values
+
+                 # Check globally initialized db connection instead of reconnecting every time
+                global _cached_db
+                if _cached_db is None:
+                    import lancedb
+                    import os
+                    if not os.path.exists("data/lancedb"):
+                        return []
+                    _cached_db = lancedb.connect("data/lancedb")
+
+                db = _cached_db
+                if "knowledge" not in db.table_names():
+                    return []
+                    
+                table = db.open_table("knowledge")
+                results = table.search(emb).limit(5).to_list()
                 
-                # Query Supabase directly via RPC
-                supabase = _init_supabase()
-                response = supabase.rpc(
-                    'match_knowledge', 
-                    {'query_embedding': emb, 'match_threshold': 0.7, 'match_count': 5}
-                ).execute()
-                
-                results = response.data
                 if not results:
                     return []
                 return [row['content'] for row in results]
