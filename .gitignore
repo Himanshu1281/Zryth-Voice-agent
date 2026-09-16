@@ -32,3 +32,6 @@ Thumbs.db
 .idea/
 .vscode/
 supabase/
+
+# --- LanceDB runtime database ---
+data/lancedb/
