@@ -123,13 +123,20 @@ class AppointmentTools:
         query: str,
     ) -> str:
         """Search the Zryth knowledge base for product details, features, or pricing.
-        
-        Use this tool when the user asks a specific question about Zryth's offerings.
-        Do NOT guess; always look it up.
-        
+
+        Only call this when the user has asked a COMPLETE, specific question about
+        Zryth's products, services, team, or pricing. DO NOT call this tool if you
+        only have a partial utterance or a single word like "what" or "tell me".
+        Wait for the user to finish their question before calling this tool.
+
         Args:
-            query: The question or search term (e.g., 'Oswal AI features').
+            query: A complete, descriptive search phrase (e.g., 'Oswal AI features', 
+                   'What products does Zryth make?'). Must be at least 3 words.
         """
+        # Guard: reject vague/partial queries
+        if not query or len(query.split()) < 3:
+            return "Please wait for the user to complete their question before searching."
+        
         log.info(f"search_knowledge -> querying for: {query}")
         
         try:
