@@ -162,11 +162,12 @@ class AppointmentTools:
                     return []
                     
                 table = db.open_table("knowledge")
-                results = table.search(emb).limit(5).to_list()
+                results = table.search(emb).limit(3).to_list()
                 
                 if not results:
                     return []
-                return [row['content'] for row in results]
+                # Truncate each chunk to keep LLM output manageable
+                return [row['content'][:300] for row in results]
                 
             results_content = await asyncio.to_thread(_do_search)
             
