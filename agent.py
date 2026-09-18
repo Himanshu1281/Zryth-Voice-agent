@@ -132,21 +132,21 @@ def _build_session(
                 model=LLM_MODEL,
                 api_key=GOOGLE_API_KEY,
                 temperature=LLM_TEMPERATURE,
-            ),
-            openai.LLM(
-                model="openai/gpt-oss-120b",
-                api_key=GROQ_API_KEY,
-                base_url="https://api.groq.com/openai/v1",
-                temperature=LLM_TEMPERATURE,
-                max_completion_tokens=MAX_TOKENS,
-            ),
-            openai.LLM(
-                model="openai/gpt-oss-safeguard-20b",
-                api_key=GROQ_API_KEY,
-                base_url="https://api.groq.com/openai/v1",
-                temperature=LLM_TEMPERATURE,
-                max_completion_tokens=MAX_TOKENS,
             )
+            # openai.LLM(
+            #     model="openai/gpt-oss-20b",
+            #     api_key=GROQ_API_KEY,
+            #     base_url="https://api.groq.com/openai/v1",
+            #     temperature=LLM_TEMPERATURE,
+            #     max_completion_tokens=MAX_TOKENS,
+            # ),
+            # openai.LLM(
+            #     model="openai/gpt-oss-safeguard-20b",
+            #     api_key=GROQ_API_KEY,
+            #     base_url="https://api.groq.com/openai/v1",
+            #     temperature=LLM_TEMPERATURE,
+            #     max_completion_tokens=MAX_TOKENS,
+            # )
         ]),
         tts=sarvam.TTS(
             model=SARVAM_TTS_MODEL,        # bulbul:v3
