@@ -172,7 +172,7 @@ def _build_session(
 # --- agents ------------------------------------------------------------------
 GREETER_INSTRUCTIONS = (
     HOT_PERSONA
-    + "\n\nYou are speaking with the caller in English. Answer their questions normally. "
+    + "\n\nYou are speaking with the caller in English. "
     "If they speak or ask for a different language, immediately call the set_language tool with the "
     "code (en, hi)."
 )
