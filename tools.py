@@ -80,6 +80,10 @@ class AppointmentTools:
             self.search_knowledge,
         ]
 
+    def reset_turn_counters(self) -> None:
+        """Reset per-turn rate-limit counters. Call this on each new user utterance."""
+        self._search_calls_this_turn = 0
+
     @function_tool
     async def capture_lead(
         self,
@@ -90,10 +94,12 @@ class AppointmentTools:
         company: Optional[str] = None,
         requirement: Optional[str] = None,
     ) -> dict:
-        """Save a potential customer's enquiry.
+        """Log a potential customer's contact details and interest.
 
-        Use this when the caller is interested in Zryth's services and
-        you have collected their name plus at least one contact method.
+        Use ONLY when the caller has expressed general interest in Zryth's services
+        but has NOT asked to schedule or book a specific meeting.
+        If they mention a date, time, or say "book/schedule a call", use
+        `book_consultation` instead.
 
         Args:
             name: Caller's full name.
@@ -130,14 +136,15 @@ class AppointmentTools:
     ) -> str:
         """Search the Zryth knowledge base for product details, features, or pricing.
 
-        Only call this when the user has asked a COMPLETE, specific question about
-        Zryth's products, services, team, or pricing. DO NOT call this tool if you
-        only have a partial utterance or a single word like "what" or "tell me".
-        Wait for the user to finish their question before calling this tool.
+        Call this ONLY when ALL of these are true:
+        - The user's utterance is a complete, finished sentence (not a fragment).
+        - It specifically concerns Zryth's products, services, team, or pricing.
+        Example — CALL: "What does Oswal AI do?" / "Tell me about Zryth's products."
+        Example — DO NOT CALL: "what" / "umm tell me" / silence / mid-sentence fragments.
 
         Args:
-            query: A complete, descriptive search phrase (e.g., 'Oswal AI features', 
-                   'What products does Zryth make?'). Must be at least 3 words.
+            query: 3+ word descriptive phrase, e.g. "Oswal AI features" or
+                   "What products does Zryth make?".
         """
         # Guard: reject vague/partial queries
         if not query or len(query.split()) < 3:
@@ -214,11 +221,11 @@ class AppointmentTools:
         preferred_date: Optional[str] = None,
         preferred_time: Optional[str] = None,
     ) -> dict:
-        """Record a request for a Zryth consultation.
+        """Record a consultation request for the Zryth team.
 
-        Use when the caller wants to discuss a project with the Zryth team.
-        Collect their name and at least one contact method before calling
-        this tool.
+        Use ONLY when the caller explicitly asks to schedule or book a meeting/call,
+        OR agrees when you offer one. If they've only expressed general interest with
+        no scheduling intent, use `capture_lead` instead.
 
         Args:
             name: Caller's full name.
@@ -277,10 +284,11 @@ class AppointmentTools:
         self,
         context: RunContext,
     ) -> dict:
-        """End the call when the customer clearly indicates the conversation is over.
+        """Ends the call and plays a goodbye message.
 
-        Only use this after the customer says goodbye, confirms they need no more
-        help, or otherwise clearly indicates that the conversation is finished.
+        Call this ONLY when the CONVERSATION ENDING conditions in the system
+        instructions are met (caller said goodbye / confirmed no further needs).
+        Do not use this for any other reason.
         """
 
         log.info("end_call requested by Maya")

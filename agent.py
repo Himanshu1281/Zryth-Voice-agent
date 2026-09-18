@@ -106,14 +106,13 @@ def _build_session(
     language: str,
     job_ctx: JobContext,
     call_id: str,
-) -> AgentSession:
+) -> tuple["AgentSession", "AppointmentTools"]:
 
-    """Wire the whole cascade for a starting language and return the session.
-    Silero VAD + Sarvam STT/TTS locked to `language`, Google Gemini LLM, Maya's tools,
-    and tight endpointing. The session owns the tools and default pipeline;
-    each LangAgent later overrides only STT + TTS to relock the language.
+    """Wire the whole cascade for a starting language. Returns (session, tools_instance).
+    The tools instance is returned separately so the caller can reset per-turn counters.
     """
     bcp47 = BCP47[language]
+    tools_instance = AppointmentTools(job_ctx, call_id)
     return AgentSession(
         vad=silero.VAD.load(
             min_silence_duration=VAD_MIN_SILENCE_S,
@@ -157,7 +156,7 @@ def _build_session(
             min_buffer_size=30,
             max_chunk_length=80,      
         ),
-	tools=AppointmentTools(job_ctx, call_id).to_tools(),
+	tools=tools_instance.to_tools(),
         turn_handling=TurnHandlingOptions(
             endpointing={
                 "mode": "fixed",
@@ -165,7 +164,9 @@ def _build_session(
                 "max_delay": MAX_ENDPOINTING_DELAY,
             },
         ),  # 1.0 s
-    )
+    ), tools_instance
+
+
 
 
 # --- agents ------------------------------------------------------------------
@@ -189,19 +190,20 @@ class BaseMayaAgent(Agent):
         """     
         code = language.strip().lower()
         if code not in SUPPORTED_LANGUAGES:
-            # Don't swap on an unknown code -- tell the LLM so it can re-ask.
             return f"Language '{language}' is not supported. Supported: {', '.join(SUPPORTED_LANGUAGES)}."
 
         # Idempotency: skip if already on the same language agent
         current = context.session.current_agent
         if isinstance(current, LangAgent) and current.code == code:
-            return f"Already in {code}. Continue responding in {code}."
+            return {"status": "already_active", "language": code}
 
-        # Swap to the new language agent so TTS uses the native language model
-        context.session.update_agent(LangAgent(code))
-        
-        # Return instructions to the LLM so it generates an answer to the user's question
-        return f"Language successfully switched to {code}. You MUST now answer the user's previous question naturally in {code} without saying 'language switched' or acknowledging the switch. CRITICAL: You MUST respond with spoken text now. DO NOT call any further tools."
+        try:
+            context.session.update_agent(LangAgent(code))
+        except Exception:
+            log.exception("update_agent failed for language=%s", code)
+            return {"status": "failed", "language": code}
+
+        return {"status": "switched", "language": code}
 
 
 class GreeterAgent(BaseMayaAgent):
@@ -301,7 +303,7 @@ async def entrypoint(ctx: JobContext) -> None:
         ctx.room.name,
     )
 
-    session = _build_session(
+    session, tools_instance = _build_session(
         DEFAULT_LANGUAGE,
         ctx,
         call_id,
@@ -323,6 +325,8 @@ async def entrypoint(ctx: JobContext) -> None:
 
         if role == "user":
             speaker = "customer"
+            # Reset per-turn tool counters on each new user utterance
+            tools_instance.reset_turn_counters()
         elif role == "assistant":
             speaker = "maya"
         else:

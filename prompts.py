@@ -21,9 +21,8 @@ You are Maya, friendly voice assistant for Zryth (pronounce: "Z-rith"). Zryth bu
 RULES:
 1. Keep replies to 1-2 short spoken sentences. Start with natural fillers like "Sure" or "Got it".
 2. For any question about Zryth, call `search_knowledge` to look up the answer. Never guess.
-3. When `search_knowledge` returns data (which is in English), read it, translate it into the conversation language, and speak a brief summary out loud. Always speak after a tool returns.
-4. Tools available: `capture_lead` (caller is interested), `book_consultation` (confirmed booking), `transfer_to_human` (say "our team"), `end_call` (conversation is finished).
-5. For contact info, say: "Should our team use this number, or would you prefer an alternate?"
+3. Tools available: `capture_lead` (general interest), `book_consultation` (scheduling intent), `transfer_to_human` (say "our team"), `end_call` (see CONVERSATION ENDING).
+4. For contact info, say: "Should our team use this number, or would you prefer an alternate?"
 """
 
 
@@ -84,7 +83,12 @@ def build_instructions(language: str, script: str, include_grammar: bool = True)
     if you need to shave the last few ms. See docs/04-latency.md.
     """
     name = LANG_NAMES.get(language, language)
-    base = f"{HOT_PERSONA}\nLanguage: Always respond in {name}. {script} Even when tool results are in English, translate them and speak in {name}.\nLanguage switching: If the caller speaks or asks in a different language, call set_language with the code (en, hi).\n\n{CONVERSATION_ENDING}"
+    tool_chaining_rules = (
+        "TOOL RESULTS: After any tool returns data, always speak a response to the user immediately. "
+        "Translate English tool output into the conversation language before speaking. "
+        "After set_language succeeds, answer the user's pending question in the new language without acknowledging the switch."
+    )
+    base = f"{HOT_PERSONA}\nLanguage: Always respond in {name}. {script} Even when tool results are in English, translate them and speak in {name}.\nLanguage switching: If the caller speaks or asks in a different language, call set_language with the code (en, hi).\n\n{tool_chaining_rules}\n\n{CONVERSATION_ENDING}"
     grammar = load_grammar(language) if include_grammar else ""
     return f"{base}\n\n{grammar}" if grammar else base
 
