@@ -40,7 +40,7 @@ SARVAM_TTS_VOICE = os.getenv("SARVAM_TTS_VOICE", "roopa")
 # --- Google Gemini (LLM) ------------------------------------------------------------
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
-LLM_MODEL = os.getenv("LLM_MODEL", "openai/gpt-oss-20b")
+LLM_MODEL = os.getenv("LLM_MODEL", "gemini-2.5-flash-lite")
 LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.3"))
 # Hard cap on reply length. Short replies = lower TTS/LLM latency on a phone call.
 MAX_TOKENS = int(os.getenv("MAX_TOKENS", "150"))

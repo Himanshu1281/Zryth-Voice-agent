@@ -128,12 +128,10 @@ def _build_session(
             sample_rate=AUDIO_SAMPLE_RATE,  # 8 kHz telephony
         ),
         llm=FallbackAdapter([
-            openai.LLM(
+            google.LLM(
                 model=LLM_MODEL,
-                api_key=GROQ_API_KEY,
-                base_url="https://api.groq.com/openai/v1",
+                api_key=GOOGLE_API_KEY,
                 temperature=LLM_TEMPERATURE,
-                max_completion_tokens=MAX_TOKENS,  # cap reply length -> lower latency
             ),
             openai.LLM(
                 model="openai/gpt-oss-120b",
