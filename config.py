@@ -34,7 +34,7 @@ SARVAM_API_KEY = os.getenv("SARVAM_API_KEY", "YOUR_SARVAM_API_KEY")
 SARVAM_STT_MODEL = os.getenv("SARVAM_STT_MODEL", "saaras:v3")
 SARVAM_TTS_MODEL = os.getenv("SARVAM_TTS_MODEL", "bulbul:v3")
 # Sarvam's TTS constructor calls this the "speaker"; the env var is *_VOICE.
-SARVAM_TTS_VOICE = os.getenv("SARVAM_TTS_VOICE", "simran")
+SARVAM_TTS_VOICE = os.getenv("SARVAM_TTS_VOICE", "roopa")
 
 
 # --- Google Gemini (LLM) ------------------------------------------------------------
