@@ -172,8 +172,8 @@ def _build_session(
 GREETER_INSTRUCTIONS = (
     HOT_PERSONA
     + "\n\nYou are speaking with the caller in English. "
-    "If they speak or ask for a different language, immediately call the set_language tool with the "
-    "code (en, hi)."
+    "If the caller starts speaking to you in a different language, or explicitly asks to change language, "
+    "immediately call the set_language tool with the language code (en, hi)."
 )
 
 
