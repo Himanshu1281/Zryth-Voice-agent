@@ -174,18 +174,7 @@ class AppointmentTools:
             if not results_content:
                 return "No relevant information found in the knowledge base."
                 
-            formatted_results = "\n\n".join(results_content)
-            
-            # Schedule a forced reply in case the LLM goes silent after the tool call
-            async def _force_reply():
-                await asyncio.sleep(0.5)
-                try:
-                    await context.session.generate_reply()
-                except Exception:
-                    pass  # Already responding
-            asyncio.create_task(_force_reply())
-            
-            return formatted_results
+            return "\n\n".join(results_content)
             
         except Exception as e:
             log.error(f"search_knowledge error: {e}")
