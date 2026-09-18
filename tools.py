@@ -167,7 +167,7 @@ class AppointmentTools:
                 return "No relevant information found in the knowledge base."
                 
             formatted_results = "\n\n".join(results_content)
-            return f"{formatted_results}\n\nCRITICAL: You MUST now respond to the user with a very brief spoken summary of this information. DO NOT call any further tools. Remember to translate the summary into the currently requested language if it is different from English."
+            return f"{formatted_results}\n\nINSTRUCTION: You must now respond to the user's question using the information above. Provide your response as natural spoken text, translated into the user's language. Do NOT make any more function calls right now."
             
         except Exception as e:
             log.error(f"search_knowledge error: {e}")
