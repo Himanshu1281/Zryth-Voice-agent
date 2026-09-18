@@ -167,7 +167,7 @@ class AppointmentTools:
                 return "No relevant information found in the knowledge base."
                 
             formatted_results = "\n\n".join(results_content)
-            return f"{formatted_results}\n\nCRITICAL: You MUST now respond to the user with a very brief spoken summary of this information. DO NOT call any further tools."
+            return f"{formatted_results}\n\nCRITICAL: You MUST now respond to the user with a very brief spoken summary of this information. DO NOT call any further tools. Remember to translate the summary into the currently requested language if it is different from English."
             
         except Exception as e:
             log.error(f"search_knowledge error: {e}")
@@ -263,21 +263,29 @@ class AppointmentTools:
                 "message": "Call ending is not available.",
             }
             
-        # Explicitly push the goodbye message into the TTS queue since the LLM often 
-        # drops text output when invoking tools.
-        await context.session.say("Thank you for your interest in Z-rith. Have a great day! Goodbye.")
+        if hasattr(context.session, "_closed") and context.session._closed:
+            return {"status": "ended", "message": "Already ending."}
+            
+        try:
+            # Explicitly push the goodbye message into the TTS queue
+            await context.session.say("Thank you for your interest in Z-rith. Have a great day! Goodbye.")
+        except RuntimeError:
+            # Ignore if already closing
+            pass
 
-	# Give the goodbye response plenty of time to finish playing before shutting down.
+        async def _delayed_shutdown():
+            import asyncio
+            # Give the goodbye response plenty of time to finish playing before shutting down.
+            await asyncio.sleep(6)
+            if self.job_ctx:
+                self.job_ctx.shutdown(reason="customer ended conversation")
+                
         import asyncio
-        await asyncio.sleep(6)
-
-        self.job_ctx.shutdown(
-            reason="customer ended conversation"
-        )
+        asyncio.create_task(_delayed_shutdown())
 
         return {
             "status": "ended",
-            "message": "The call has been ended.",
+            "message": "The call is ending. DO NOT say anything else. DO NOT call any further tools.",
         }
 
 if __name__ == "__main__":
