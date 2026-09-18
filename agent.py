@@ -192,6 +192,11 @@ class BaseMayaAgent(Agent):
             # Don't swap on an unknown code -- tell the LLM so it can re-ask.
             return f"Language '{language}' is not supported. Supported: {', '.join(SUPPORTED_LANGUAGES)}."
 
+        # Idempotency: skip if already on the same language agent
+        current = context.session.current_agent
+        if isinstance(current, LangAgent) and current.code == code:
+            return f"Already in {code}. Continue responding in {code}."
+
         # Swap to the new language agent so TTS uses the native language model
         context.session.update_agent(LangAgent(code))
         
@@ -277,12 +282,18 @@ async def entrypoint(ctx: JobContext) -> None:
     start_time = time.time()
 
     # Create one Supabase record for this call.
-    call_id = await asyncio.to_thread(
-        create_call,
-        livekit_room=ctx.room.name,
-        phone=phone,
-        language=DEFAULT_LANGUAGE,
-    )
+    # Fall back to a local UUID if Supabase is unavailable so the call continues.
+    try:
+        call_id = await asyncio.to_thread(
+            create_call,
+            livekit_room=ctx.room.name,
+            phone=phone,
+            language=DEFAULT_LANGUAGE,
+        )
+    except Exception:
+        import uuid
+        call_id = str(uuid.uuid4())
+        log.exception("Supabase create_call failed; using in-memory call_id=%s", call_id)
 
     log.info(
         "Supabase call created: %s for room %s",
@@ -318,12 +329,16 @@ async def entrypoint(ctx: JobContext) -> None:
             return
 
         async def _save():
-            try:
-                await asyncio.to_thread(save_message, call_id, speaker, text)
-                log.info("Saved %s message", speaker)
-            except Exception:
-                # Never allow database issues to break the live call.
-                log.exception("Failed to save conversation message")
+            for attempt in range(3):
+                try:
+                    await asyncio.to_thread(save_message, call_id, speaker, text)
+                    log.info("Saved %s message", speaker)
+                    return
+                except Exception:
+                    if attempt == 2:
+                        log.exception("Failed to save %s message after 3 attempts — dropping", speaker)
+                    else:
+                        await asyncio.sleep(2 ** attempt)  # 1s, 2s backoff
         
         asyncio.create_task(_save())
 

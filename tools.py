@@ -58,12 +58,18 @@ def _save_lead(lead: dict) -> None:
     )
 
 
+# Per-instance call tracking to rate-limit search_knowledge
+_SEARCH_RATE_LIMIT = 4  # max search calls per turn
+
+
 class AppointmentTools:
     """Tools Maya can use during a Zryth customer call."""
 
     def __init__(self, job_ctx: JobContext | None = None, call_id: str | None = None) -> None:
         self.job_ctx = job_ctx
         self.call_id = call_id
+        self._search_calls_this_turn: int = 0  # rate-limit counter
+        self._shutdown_task: asyncio.Task | None = None  # track pending shutdown
 
     def to_tools(self) -> list:
         return [
@@ -137,6 +143,12 @@ class AppointmentTools:
         if not query or len(query.split()) < 3:
             return "Please wait for the user to complete their question before searching."
         
+        # Rate-limit: reset counter at start of each tool call, then check
+        self._search_calls_this_turn += 1
+        if self._search_calls_this_turn > _SEARCH_RATE_LIMIT:
+            log.warning("search_knowledge rate limit hit (%d calls this turn)", self._search_calls_this_turn)
+            return "You have already searched enough. Please answer the user with what you know."
+        
         log.info(f"search_knowledge -> querying for: {query}")
         
         try:
@@ -159,7 +171,17 @@ class AppointmentTools:
 
                 db = _cached_db
                 if "knowledge" not in db.table_names():
-                    return []
+                    # Table missing — try invalidating the cached connection and reconnecting once
+                    log.warning("'knowledge' table not found, re-syncing LanceDB...")
+                    _cached_db = None
+                    from database import sync_knowledge_to_lancedb
+                    sync_knowledge_to_lancedb()
+                    import lancedb as _lancedb
+                    from database import LANCEDB_PATH
+                    _cached_db = _lancedb.connect(LANCEDB_PATH)
+                    db = _cached_db
+                    if "knowledge" not in db.table_names():
+                        return []
                     
                 table = db.open_table("knowledge")
                 results = table.search(emb).limit(3).to_list()
@@ -280,15 +302,20 @@ class AppointmentTools:
             # Ignore if already closing
             pass
 
+        # Cancel any pending duplicate shutdown
+        if self._shutdown_task and not self._shutdown_task.done():
+            self._shutdown_task.cancel()
+
         async def _delayed_shutdown():
-            import asyncio
-            # Give the goodbye response plenty of time to finish playing before shutting down.
+            # Give the goodbye audio time to finish before shutting down.
             await asyncio.sleep(6)
             if self.job_ctx:
-                self.job_ctx.shutdown(reason="customer ended conversation")
-                
-        import asyncio
-        asyncio.create_task(_delayed_shutdown())
+                try:
+                    self.job_ctx.shutdown(reason="customer ended conversation")
+                except Exception as exc:
+                    log.warning("shutdown() raised: %s", exc)
+
+        self._shutdown_task = asyncio.create_task(_delayed_shutdown())
 
         return {
             "status": "ended",
