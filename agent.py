@@ -128,9 +128,10 @@ def _build_session(
             sample_rate=AUDIO_SAMPLE_RATE,  # 8 kHz telephony
         ),
         llm=FallbackAdapter([
-            google.LLM(
+            openai.LLM(
                 model=LLM_MODEL,
                 api_key=GOOGLE_API_KEY,
+                base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
                 temperature=LLM_TEMPERATURE,
             )
             # openai.LLM(
