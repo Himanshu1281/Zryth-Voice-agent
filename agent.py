@@ -391,9 +391,33 @@ if __name__ == "__main__":
     log.info("Performing initial LanceDB sync...")
     sync_knowledge_to_lancedb()
 
-    agents.cli.run_app(
-        WorkerOptions(
-            entrypoint_fnc=entrypoint,
-            agent_name=os.getenv("AGENT_NAME", "maya"),
+    from database import _init_supabase
+
+    try:
+        supabase = _init_supabase()
+        supabase.table("agent_status").upsert({
+            "agent_id": "maya_v2", 
+            "status": "active",
+            "last_heartbeat": "now()"
+        }).execute()
+        log.info("Agent status set to active in Supabase.")
+    except Exception as e:
+        log.error(f"Failed to set agent status to active: {e}")
+
+    try:
+        agents.cli.run_app(
+            WorkerOptions(
+                entrypoint_fnc=entrypoint,
+                agent_name=os.getenv("AGENT_NAME", "maya"),
+            )
         )
-    )
+    finally:
+        try:
+            supabase = _init_supabase()
+            supabase.table("agent_status").upsert({
+                "agent_id": "maya_v2", 
+                "status": "inactive"
+            }).execute()
+            log.info("Agent status set to inactive in Supabase.")
+        except Exception as e:
+            log.error(f"Failed to set agent status to inactive: {e}")
