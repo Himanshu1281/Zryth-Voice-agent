@@ -152,6 +152,47 @@ def finish_call(call_id: str, duration_seconds: int = 0) -> None:
         .execute()
     )
 
+def fetch_dynamic_prompt(tag: str, fallback_content: str, agent_id: str = "maya_v2") -> str:
+    """Fetch a custom prompt from Supabase if it's explicitly assigned to the agent."""
+    try:
+        sb = _init_supabase()
+        
+        # 1. Check if the prompt is assigned to this agent
+        assignment = sb.table("agent_prompts").select("*").eq("agent_id", agent_id).eq("prompt_tag", tag).execute()
+        
+        # If it's not explicitly assigned, immediately return the default hardcoded greeting
+        if not assignment.data or len(assignment.data) == 0:
+            return fallback_content 
+        # 2. If it IS assigned, fetch the custom content from the prompts table
+        response = sb.table("prompts").select("content").eq("tag", tag).execute()
+        
+        if response.data and len(response.data) > 0:
+            return response.data[0]["content"]
+    except Exception as e:
+        log.error(f"Failed to fetch prompt '{tag}': {e}")
+        
+    return fallback_content
+
+def fetch_assigned_tools(agent_id: str = "maya_v2") -> list[dict]:
+    """Fetch JSON specs for tools explicitly assigned to the agent."""
+    try:
+        sb = _init_supabase()
+        
+        # 1. Find assigned tool names
+        assignments = sb.table("agent_tools").select("tool_name").eq("agent_id", agent_id).execute()
+        if not assignments.data:
+            return []
+            
+        names = [row["tool_name"] for row in assignments.data]
+        
+        # 2. Fetch the actual tool JSON specs
+        response = sb.table("tools").select("*").in_("name", names).execute()
+        return response.data if response.data else []
+        
+    except Exception as e:
+        log.error(f"Failed to fetch assigned tools for '{agent_id}': {e}")
+        return []
+
 def sync_knowledge_to_lancedb() -> None:
     """Sync Supabase knowledge base to local LanceDB."""
 

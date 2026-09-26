@@ -9,12 +9,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 import os
+from functools import lru_cache
 
 from google import genai
 from livekit.agents import JobContext, RunContext, function_tool
 
 from config import DEFAULT_TRANSFER_NUMBER
 from database import _init_supabase, update_call_lead
+from dynamic_executor import execute_tool_call
 
 # Initialize the Gemini client for embeddings
 if os.getenv('CI') or os.getenv('GITHUB_ACTIONS'):
@@ -62,6 +64,81 @@ def _save_lead(lead: dict) -> None:
 _SEARCH_RATE_LIMIT = 4  # max search calls per turn
 
 
+@lru_cache(maxsize=256)
+def _cached_search(query: str) -> tuple[str, ...]:
+    res = llm_client.models.embed_content(
+        model='gemini-embedding-2',
+        contents=query,
+    )
+    emb = res.embeddings[0].values
+
+    # Check globally initialized db connection instead of reconnecting every time
+    global _cached_db
+    if _cached_db is None:
+        import lancedb
+        import os
+        from database import LANCEDB_PATH
+        if not os.path.exists(LANCEDB_PATH):
+            return tuple()
+        _cached_db = lancedb.connect(LANCEDB_PATH)
+
+    db = _cached_db
+    if "knowledge" not in db.table_names():
+        # Table missing — try invalidating the cached connection and reconnecting once
+        log.warning("'knowledge' table not found, re-syncing LanceDB...")
+        _cached_db = None
+        from database import sync_knowledge_to_lancedb
+        sync_knowledge_to_lancedb()
+        import lancedb as _lancedb
+        from database import LANCEDB_PATH
+        _cached_db = _lancedb.connect(LANCEDB_PATH)
+        db = _cached_db
+        if "knowledge" not in db.table_names():
+            return tuple()
+        
+    table = db.open_table("knowledge")
+    results = table.search(emb).limit(3).to_list()
+    
+    if not results:
+        return tuple()
+    # Truncate each chunk to keep LLM output manageable
+    return tuple([row['content'][:300] for row in results])
+
+
+def build_dynamic_tools(tool_specs: list[dict]) -> list:
+    """Convert Supabase JSON tool specs into LiveKit tools using the dynamic executor."""
+    dynamic_tools = []
+    
+    for spec in tool_specs:
+        tool_name = spec.get("name")
+        json_spec = spec.get("json_spec", {})
+        instruction = spec.get("execution_instruction", "")
+        
+        if not tool_name:
+            continue
+            
+        def make_wrapper(name, json, instr):
+            async def _dynamic_wrapper(context: RunContext, raw_arguments: dict) -> dict:
+                return await asyncio.to_thread(
+                    execute_tool_call, name, json, instr, raw_arguments
+                )
+            return _dynamic_wrapper
+            
+        wrapper_func = make_wrapper(tool_name, json_spec, instruction)
+            
+        # LiveKit's function_tool supports `raw_schema` precisely for this!
+        raw_schema = {
+            "name": tool_name,
+            "description": instruction,
+            "parameters": json_spec.get("input_schema", {"type": "object", "properties": {}})
+        }
+        
+        tool = function_tool(wrapper_func, raw_schema=raw_schema)
+        dynamic_tools.append(tool)
+        
+    return dynamic_tools
+
+
 class AppointmentTools:
     """Tools Maya can use during a Zryth customer call."""
 
@@ -76,7 +153,7 @@ class AppointmentTools:
             self.capture_lead,
             self.book_consultation,
             self.transfer_to_human,
-	    self.end_call,
+            self.end_call,
             self.search_knowledge,
         ]
 
@@ -146,8 +223,8 @@ class AppointmentTools:
             query: 3+ word descriptive phrase, e.g. "Oswal AI features" or
                    "What products does Zryth make?".
         """
-        # Guard: reject vague/partial queries
-        if not query or len(query.split()) < 3:
+        # Guard: reject empty queries
+        if not query or len(query.strip()) == 0:
             return "Please wait for the user to complete their question before searching."
         
         # Rate-limit: reset counter at start of each tool call, then check
@@ -159,46 +236,7 @@ class AppointmentTools:
         log.info(f"search_knowledge -> querying for: {query}")
         
         try:
-            def _do_search():
-                res = llm_client.models.embed_content(
-                    model='gemini-embedding-2',
-                    contents=query,
-                )
-                emb = res.embeddings[0].values
-
-                 # Check globally initialized db connection instead of reconnecting every time
-                global _cached_db
-                if _cached_db is None:
-                    import lancedb
-                    import os
-                    from database import LANCEDB_PATH
-                    if not os.path.exists(LANCEDB_PATH):
-                        return []
-                    _cached_db = lancedb.connect(LANCEDB_PATH)
-
-                db = _cached_db
-                if "knowledge" not in db.table_names():
-                    # Table missing — try invalidating the cached connection and reconnecting once
-                    log.warning("'knowledge' table not found, re-syncing LanceDB...")
-                    _cached_db = None
-                    from database import sync_knowledge_to_lancedb
-                    sync_knowledge_to_lancedb()
-                    import lancedb as _lancedb
-                    from database import LANCEDB_PATH
-                    _cached_db = _lancedb.connect(LANCEDB_PATH)
-                    db = _cached_db
-                    if "knowledge" not in db.table_names():
-                        return []
-                    
-                table = db.open_table("knowledge")
-                results = table.search(emb).limit(3).to_list()
-                
-                if not results:
-                    return []
-                # Truncate each chunk to keep LLM output manageable
-                return [row['content'][:300] for row in results]
-                
-            results_content = await asyncio.to_thread(_do_search)
+            results_content = await asyncio.to_thread(_cached_search, query)
             
             if not results_content:
                 return "No relevant information found in the knowledge base."
@@ -284,12 +322,7 @@ class AppointmentTools:
         self,
         context: RunContext,
     ) -> dict:
-        """Ends the call and plays a goodbye message.
-
-        Call this ONLY when the CONVERSATION ENDING conditions in the system
-        instructions are met (caller said goodbye / confirmed no further needs).
-        Do not use this for any other reason.
-        """
+        """Initiates the call termination sequence. Use when the conversation is finished."""
 
         log.info("end_call requested by Maya")
 
@@ -302,20 +335,13 @@ class AppointmentTools:
             
         if hasattr(context.session, "_closed") and context.session._closed:
             return {"status": "ended", "message": "Already ending."}
-            
-        try:
-            # Explicitly push the goodbye message into the TTS queue
-            await context.session.say("Thank you for your interest in Z-rith. Have a great day! Goodbye.")
-        except RuntimeError:
-            # Ignore if already closing
-            pass
 
         # Cancel any pending duplicate shutdown
         if self._shutdown_task and not self._shutdown_task.done():
             self._shutdown_task.cancel()
 
         async def _delayed_shutdown():
-            # Give the goodbye audio time to finish before shutting down.
+            # Give the LLM's goodbye audio time to finish before shutting down.
             await asyncio.sleep(6)
             if self.job_ctx:
                 try:
@@ -326,8 +352,8 @@ class AppointmentTools:
         self._shutdown_task = asyncio.create_task(_delayed_shutdown())
 
         return {
-            "status": "ended",
-            "message": "The call is ending. DO NOT say anything else. DO NOT call any further tools.",
+            "status": "ending",
+            "message": "Call ending sequence initiated. Please say a brief, polite goodbye to the user.",
         }
 
 if __name__ == "__main__":

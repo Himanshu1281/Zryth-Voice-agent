@@ -77,13 +77,15 @@ from prompts import (
     STYLE_NOTES,
     build_instructions,
 )
-from tools import AppointmentTools
+from tools import AppointmentTools, build_dynamic_tools
 
 from database import (
     create_call, 
     save_message, 
     finish_call, 
     sync_knowledge_to_lancedb, 
+    fetch_dynamic_prompt,
+    fetch_assigned_tools,
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -100,12 +102,21 @@ CONFIRMATIONS: dict[str, str] = {
     "hi": "ठीक है, अब हम हिंदी में बात करेंगे।",
 }
 
+def _should_trigger_llm(text: str) -> bool:
+    text = text.strip()
+    if len(text.split()) < 6:
+        return False
+    if text.endswith((",", "…", "um", "uh")):
+        return False
+    return True
+
 
 # --- pipeline wiring ---------------------------------------------------------
 def _build_session(
     language: str,
     job_ctx: JobContext,
     call_id: str,
+    dynamic_tool_specs: list[dict],
 ) -> tuple["AgentSession", "AppointmentTools"]:
 
     """Wire the whole cascade for a starting language. Returns (session, tools_instance).
@@ -113,6 +124,9 @@ def _build_session(
     """
     bcp47 = BCP47[language]
     tools_instance = AppointmentTools(job_ctx, call_id)
+    
+    tools_list = tools_instance.to_tools()
+    tools_list.extend(build_dynamic_tools(dynamic_tool_specs))
     return AgentSession(
         vad=silero.VAD.load(
             min_silence_duration=VAD_MIN_SILENCE_S,
@@ -127,26 +141,20 @@ def _build_session(
             sample_rate=AUDIO_SAMPLE_RATE,  # 8 kHz telephony
         ),
         llm=FallbackAdapter([
+            # Fast path: Groq for low TTFT
+            openai.LLM(
+                model="openai/gpt-oss-20b",
+                api_key=GROQ_API_KEY,
+                base_url="https://api.groq.com/openai/v1",
+                temperature=LLM_TEMPERATURE,
+            ),
+            # Fallback: Gemini Flash‑Lite for capacity/quality
             openai.LLM(
                 model=LLM_MODEL,
                 api_key=GOOGLE_API_KEY,
                 base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
                 temperature=LLM_TEMPERATURE,
             )
-            # openai.LLM(
-            #     model="openai/gpt-oss-20b",
-            #     api_key=GROQ_API_KEY,
-            #     base_url="https://api.groq.com/openai/v1",
-            #     temperature=LLM_TEMPERATURE,
-            #     max_completion_tokens=MAX_TOKENS,
-            # ),
-            # openai.LLM(
-            #     model="openai/gpt-oss-safeguard-20b",
-            #     api_key=GROQ_API_KEY,
-            #     base_url="https://api.groq.com/openai/v1",
-            #     temperature=LLM_TEMPERATURE,
-            #     max_completion_tokens=MAX_TOKENS,
-            # )
         ]),
         tts=sarvam.TTS(
             model=SARVAM_TTS_MODEL,        # bulbul:v3
@@ -156,7 +164,7 @@ def _build_session(
             min_buffer_size=30,
             max_chunk_length=80,      
         ),
-	tools=tools_instance.to_tools(),
+	tools=tools_list,
         turn_handling=TurnHandlingOptions(
             endpointing={
                 "mode": "fixed",
@@ -170,12 +178,6 @@ def _build_session(
 
 
 # --- agents ------------------------------------------------------------------
-GREETER_INSTRUCTIONS = (
-    HOT_PERSONA
-    + "\n\nYou are speaking with the caller in English. "
-    "If the caller starts speaking to you in a different language, or explicitly asks to change language, "
-    "immediately call the set_language tool with the language code (en, hi)."
-)
 
 
 class BaseMayaAgent(Agent):
@@ -210,7 +212,13 @@ class GreeterAgent(BaseMayaAgent):
     """Greets the caller in English and detects their language."""
 
     def __init__(self) -> None:
-        super().__init__(instructions=GREETER_INSTRUCTIONS)
+        instructions = (
+            HOT_PERSONA
+            + "\n\nYou are speaking with the caller in English. "
+            "Do NOT change language based on a single word or mispronunciation. "
+            "ONLY call the set_language tool with the language code (en, hi) if the caller explicitly asks to change the language or speaks multiple full sentences in a different language."
+        )
+        super().__init__(instructions=instructions)
 
 
 class LangAgent(BaseMayaAgent):
@@ -302,16 +310,51 @@ async def entrypoint(ctx: JobContext) -> None:
         call_id,
         ctx.room.name,
     )
+    
+    dynamic_greeting = await asyncio.to_thread(
+        fetch_dynamic_prompt,
+        "greeting_prompt",
+        GREETINGS[DEFAULT_LANGUAGE]
+    )
+    
+    dynamic_tool_specs = await asyncio.to_thread(
+        fetch_assigned_tools,
+        "maya_v2"
+    )
 
     session, tools_instance = _build_session(
         DEFAULT_LANGUAGE,
         ctx,
         call_id,
+        dynamic_tool_specs,
     )
     session.on(
         "metrics_collected",
         _make_metrics_handler(ctx.room.name),
     )
+
+    async def _trigger_early_reply(partial_text: str, session: "AgentSession") -> None:
+        """
+        Trigger a reply early to mask STT latency without duplicating user messages.
+        """
+        try:
+            # Do NOT manually edit chat_ctx here; let the framework manage messages.
+            # Just trigger generation based on current context.
+            if hasattr(session, "generate_reply"):
+                await session.generate_reply()
+            elif hasattr(session, "_trigger_agent"):
+                session._trigger_agent()
+        except Exception as e:
+            log.warning(f"Could not trigger early reply: {e}")
+
+    def _on_stt_interim(event) -> None:
+        text = getattr(event, "text", "") or ""
+        if not _should_trigger_llm(text):
+            return
+        asyncio.create_task(_trigger_early_reply(text, session))
+
+    # Subscribe to interim STT events
+    session.on("stt_interim_transcript", _on_stt_interim)
 
     # Save customer and Maya messages.
     def on_conversation_item(event) -> None:
@@ -376,14 +419,12 @@ async def entrypoint(ctx: JobContext) -> None:
         save_message(
             call_id=call_id,
             speaker="maya",
-            message=GREETINGS[DEFAULT_LANGUAGE],
+            message=dynamic_greeting,
         )
     except Exception:
         log.exception("Failed to save opening greeting")
 
-    await session.say(
-        GREETINGS[DEFAULT_LANGUAGE]
-    )
+    await session.say(dynamic_greeting)
 
 
 if __name__ == "__main__":
@@ -403,6 +444,26 @@ if __name__ == "__main__":
         log.info("Agent status set to active in Supabase.")
     except Exception as e:
         log.error(f"Failed to set agent status to active: {e}")
+
+
+    import threading
+    import time
+
+    def heartbeat_loop():
+        while True:
+            try:
+                sb = _init_supabase()
+                sb.table("agent_status").upsert({
+                    "agent_id": "maya_v2", 
+                    "status": "active",
+                    "last_heartbeat": "now()"
+                }).execute()
+            except Exception as e:
+                log.error(f"Heartbeat failed: {e}")
+            time.sleep(10)
+
+    t = threading.Thread(target=heartbeat_loop, daemon=True)
+    t.start()
 
     try:
         agents.cli.run_app(
