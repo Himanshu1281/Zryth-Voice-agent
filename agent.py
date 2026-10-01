@@ -321,9 +321,14 @@ class BaseMayaAgent(Agent):
                 text = f"{prev[-1]} {text}"
         chunks = await self.kb.retrieve_for_turn(text)
         if chunks:
+            # Must be "system": as "assistant", Gemini continues the message and reads
+            # the raw chunks aloud ("[Zryth Company Profile] Zryth's AI products are...").
             turn_ctx.add_message(
-                role="assistant",
-                content="Relevant Zryth knowledge for the caller's next message:\n" + "\n\n".join(chunks),
+                role="system",
+                content=(
+                    "Relevant Zryth knowledge (reference only; never read it out verbatim, "
+                    "answer the caller in your own short words):\n" + "\n\n".join(chunks)
+                ),
             )
 
     async def _switch_language(self, code: str) -> None:

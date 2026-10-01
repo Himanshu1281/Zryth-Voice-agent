@@ -82,6 +82,9 @@ _SMALL_TALK = re.compile(
 # STT mis-hearings of Zryth names -> spelling used in the knowledge base.
 # Sarvam STT has no keyterm boosting, so we normalise before retrieval.
 _NAME_ALIASES = [
+    # Hindi STT of "Oswaal AI": "उस वाले ऐसे", "उस वाले आए", "एशो oil" (seen on live calls).
+    (re.compile(r"(?:उस ?वाले?|ओ[सस्]+वाल|एशो)\s+(?:ए\s?आई|एआई|ऐसे|आए|ए|AI|oil)(?=[\s।.?!,]|$)", re.I), "Oswaal AI"),
+    (re.compile(r"ओस्?वाल"), "Oswaal"),
     (re.compile(r"\b(?:oswal|oswall|osval|oswaal)\b", re.I), "Oswaal"),
     (re.compile(r"\b(?:zyrth|zrith|zerith|zareth|zarith|zarid|zerid|zaret)\b", re.I), "Zryth"),
 ]
@@ -189,7 +192,8 @@ async def _cached_search(query: str) -> tuple[tuple[str, ...], float]:
     ]
     best = max((sc for sc, _ in scored), default=0.0)
     # Chunks are sentence-aligned and <= ~1000 chars; don't cut them mid-sentence.
-    result = (tuple(c for sc, c in scored if sc >= _RELEVANCE_FLOOR), best)
+    # dict.fromkeys drops duplicate rows (same chunk ingested twice), keeping order.
+    result = (tuple(dict.fromkeys(c for sc, c in scored if sc >= _RELEVANCE_FLOOR)), best)
     
     async with _search_cache_lock:
         _search_cache[query] = result
