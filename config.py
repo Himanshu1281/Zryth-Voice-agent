@@ -17,7 +17,7 @@ from dotenv import load_dotenv
 
 # Load a local .env if present. In production the values come from the systemd
 # EnvironmentFile instead, so this is a no-op there.
-load_dotenv()
+load_dotenv(override=True)
 
 
 # --- LiveKit -----------------------------------------------------------------
@@ -40,10 +40,20 @@ SARVAM_TTS_VOICE = os.getenv("SARVAM_TTS_VOICE", "roopa")
 # --- Google Gemini (LLM) ------------------------------------------------------------
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
-LLM_MODEL = os.getenv("LLM_MODEL", "gemini-2.5-flash-lite-001")
+# When GROQ_API_KEY is set, Groq is the primary LLM and Gemini (LLM_MODEL) the
+# automatic fallback. Measured TTFT with the real prompt (India, 2026-10):
+#   qwen/qwen3.8-27b, reasoning off   ~170-300 ms
+#   gemini-2.5-flash-lite             ~1000-1600 ms
+#   openai/gpt-oss-20b / 120b         reasoning models: slower and add odd unicode
+# Groq's free tier allows only 8000 tokens/min (~4-8 turns/min in total): on a
+# 429 we fail over to Gemini immediately (no retries). Use a paid Groq tier in
+# production to stay on the fast path.
+GROQ_MODEL = os.getenv("GROQ_MODEL", "qwen/qwen3.8-27b")
+GROQ_REASONING_EFFORT = os.getenv("GROQ_REASONING_EFFORT", "none")
+LLM_MODEL = os.getenv("LLM_MODEL", "gemini-2.5-flash-lite")
 LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.3"))
 # Hard cap on reply length. Short replies = lower TTS/LLM latency on a phone call.
-MAX_TOKENS = int(os.getenv("MAX_TOKENS", "150"))
+MAX_TOKENS = int(os.getenv("MAX_TOKENS", "90"))
 
 
 # --- Agent behaviour ---------------------------------------------------------
@@ -59,16 +69,19 @@ VAD_ACTIVATION_THRESHOLD = float(os.getenv("VAD_ACTIVATION_THRESHOLD", "0.8"))
 VAD_MIN_SPEECH_DURATION = float(os.getenv("VAD_MIN_SPEECH_DURATION", "0.3"))
 
 # Endpointing window (how long to wait for the caller to resume before treating
-# the turn as finished). Tuned tight for snappy phone turns.
-MIN_ENDPOINTING_DELAY = float(os.getenv("MIN_ENDPOINTING_DELAY", "0.15"))
-MAX_ENDPOINTING_DELAY = float(os.getenv("MAX_ENDPOINTING_DELAY", "0.5"))
+# the turn as finished). Too tight (<0.3 s) cuts callers off mid-sentence.
+MIN_ENDPOINTING_DELAY = float(os.getenv("MIN_ENDPOINTING_DELAY", "0.4"))
+MAX_ENDPOINTING_DELAY = float(os.getenv("MAX_ENDPOINTING_DELAY", "1.0"))
+
+# Seconds of caller silence before Maya checks "are you still there?".
+USER_AWAY_TIMEOUT_S = float(os.getenv("USER_AWAY_TIMEOUT_S", "20"))
 
 # Telephony sample rate. 8 kHz end-to-end is the latency recipe for phone audio.
 AUDIO_SAMPLE_RATE = 8000
 
 
 # --- Telephony / transfer ----------------------------------------------------
-DEFAULT_TRANSFER_NUMBER = os.getenv("DEFAULT_TRANSFER_NUMBER", "+91XXXXXXXXXX")
+DEFAULT_TRANSFER_NUMBER = os.getenv("DEFAULT_TRANSFER_NUMBER", "+918591194506")
 
 
 # --- Language map ------------------------------------------------------------

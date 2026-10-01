@@ -70,11 +70,25 @@ async def knowledge_sync(
     )
 
     try:
+        from database import KB_AUTO_HEAL
+
+        # Re-chunk anything the uploader wrote with a different chunker first
+        # (only on the host where KB_AUTO_HEAL=true, to avoid duplicate rows).
+        fixed = []
+        if KB_AUTO_HEAL:
+            from knowledge_ingest import heal_legacy_chunks
+
+            try:
+                fixed = heal_legacy_chunks()
+            except Exception:
+                log.exception("Legacy chunk healing failed; syncing rows as they are")
+
         sync_knowledge_to_lancedb()
 
         return {
             "status": "ok",
             "message": "LanceDB synchronization completed",
+            "rechunked": fixed,
         }
 
     except Exception as exc:
@@ -87,6 +101,39 @@ async def knowledge_sync(
             status_code=500,
             detail="LanceDB synchronization failed",
         )
+
+class IngestRequest(BaseModel):
+    filename: str  # object name in the knowledge_base bucket (.pdf or .txt)
+
+
+@app.post("/internal/knowledge/ingest")
+async def knowledge_ingest(
+    req: IngestRequest,
+    x_webhook_secret: str | None = Header(default=None),
+):
+    """Chunk + embed one uploaded file the same way the agent expects.
+
+    The dashboard should call this after uploading to the bucket instead of
+    chunking itself. Replaces that file's existing rows.
+    """
+    if not WEBHOOK_SECRET or not x_webhook_secret or not hmac.compare_digest(
+        x_webhook_secret, WEBHOOK_SECRET
+    ):
+        raise HTTPException(status_code=401, detail="Invalid webhook secret")
+
+    from knowledge_ingest import ingest_source
+    from starlette.concurrency import run_in_threadpool
+
+    try:
+        count = await run_in_threadpool(ingest_source, req.filename)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception:
+        log.exception("Ingest failed for %s", req.filename)
+        raise HTTPException(status_code=500, detail="Ingest failed")
+
+    return {"status": "ok", "filename": req.filename, "chunks": count}
+
 
 class SummarizeRequest(BaseModel):
     transcript: str

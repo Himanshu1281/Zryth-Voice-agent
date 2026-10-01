@@ -21,6 +21,9 @@ LANCEDB_PATH = os.path.join(BASE_DIR, "data", "lancedb")
 
 _lancedb_sync_lock = threading.Lock()
 
+# Re-chunk knowledge written by other chunkers. Enable on ONE host only.
+KB_AUTO_HEAL = os.getenv("KB_AUTO_HEAL", "false").strip().lower() in ("1", "true", "yes")
+
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_SECRET_KEY = os.getenv("SUPABASE_SECRET_KEY")
 
@@ -80,7 +83,7 @@ def create_call(
     response = (
         _init_supabase()
         .table("calls")
-        .insert(data)
+        .upsert(data, on_conflict="livekit_room")
         .execute()
     )
 
@@ -151,6 +154,30 @@ def finish_call(call_id: str, duration_seconds: int = 0) -> None:
         .eq("id", call_id)
         .execute()
     )
+
+def set_call_phone(call_id: str, phone: str) -> None:
+    """Store the caller's real SIP number on the call record."""
+    _init_supabase().table("calls").update({"phone": phone}).eq("id", call_id).execute()
+
+
+def log_knowledge_gap(call_id: Optional[str], query: str) -> None:
+    """Record a caller question the knowledge base couldn't answer."""
+    _init_supabase().table("knowledge_gaps").insert(
+        {"call_id": call_id, "query": query.strip()}
+    ).execute()
+
+
+def save_call_summary(
+    call_id: str,
+    summary: str,
+    intent: Optional[str] = None,
+    outcome: Optional[str] = None,
+) -> None:
+    """Attach the post-call summary to the call record."""
+    _init_supabase().table("calls").update(
+        {"summary": summary, "intent": intent, "outcome": outcome}
+    ).eq("id", call_id).execute()
+
 
 def fetch_dynamic_prompt(tag: str, fallback_content: str, agent_id: str = "maya_v2") -> str:
     """Fetch a custom prompt from Supabase if it's explicitly assigned to the agent."""
@@ -336,6 +363,19 @@ async def realtime_sync_loop() -> None:
             "Supabase Realtime change detected. "
             "Synchronizing LanceDB..."
         )
+
+        # Rows written by another chunker (e.g. the dashboard upload) get rebuilt
+        # sentence-aware. Opt-in (KB_AUTO_HEAL=true) on exactly ONE host: if several
+        # agent hosts healed concurrently they would insert duplicate chunks.
+        if KB_AUTO_HEAL:
+            try:
+                from knowledge_ingest import heal_legacy_chunks
+
+                fixed = await asyncio.to_thread(heal_legacy_chunks)
+                if fixed:
+                    log.info("Re-chunked legacy knowledge sources: %s", fixed)
+            except Exception:
+                log.exception("Legacy chunk healing failed; syncing rows as they are")
 
         try:
             await asyncio.to_thread(

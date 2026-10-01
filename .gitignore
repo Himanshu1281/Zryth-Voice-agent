@@ -35,3 +35,9 @@ supabase/
 
 # --- LanceDB runtime database ---
 data/lancedb/
+
+# Knowledge-base backups (contain full KB content + embeddings)
+data/backups/
+
+# Local debugging scripts (not deployed)
+test_search.py

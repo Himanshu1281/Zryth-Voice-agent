@@ -8,9 +8,9 @@ Pipeline (cascade), tuned for ~700 ms-1.2 s perceived turn latency on one India 
     Silero VAD -> Sarvam Saaras STT (codemix, 8 kHz) -> Google Gemini
     -> Sarvam Bulbul TTS.
 
-Language flow: a GreeterAgent greets in English and detects the caller's
-language, then hands off to a per-language LangAgent that locks STT + TTS to
-that language. See GreeterAgent.set_language for the (important) silent-swap fix.
+Language flow: STT auto-detects English/Hindi on every utterance; each turn the
+agent switches the reply language and TTS voice to match the caller
+(BaseMayaAgent._switch_language).
 """
 
 from __future__ import annotations
@@ -19,16 +19,26 @@ import asyncio
 import json
 import logging
 import os
+import re
 import time
 from pathlib import Path
 
 # --- TLS / cert guard (optional) --------------------------------------------
-# On some minimal VPS images the system CA bundle is missing and Sarvam/Google
-# TLS handshakes fail. Pointing at certifi's bundle avoids that. Best-effort.
+# Only when the OS has no CA bundle (some minimal images) point at certifi's.
+# Setting SSL_CERT_FILE unconditionally makes every new HTTP client re-read the
+# bundle on the event loop (~200 ms each, seen as "event loop blocked" at call
+# start, delaying the greeting).
 try:
-    import certifi
+    import ssl
 
-    os.environ.setdefault("SSL_CERT_FILE", certifi.where())
+    _paths = ssl.get_default_verify_paths()
+    if not (
+        (_paths.cafile and os.path.exists(_paths.cafile))
+        or (_paths.capath and os.path.isdir(_paths.capath))
+    ):
+        import certifi
+
+        os.environ.setdefault("SSL_CERT_FILE", certifi.where())
 except Exception:  # pragma: no cover - purely defensive
     pass
 
@@ -37,6 +47,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from livekit import agents
+from livekit import api as lk_api
 from livekit.agents import (
     Agent,
     TurnHandlingOptions,
@@ -48,6 +59,7 @@ from livekit.agents import (
     function_tool,
     metrics,
 )
+from livekit.agents import NOT_GIVEN
 from livekit.agents.llm import FallbackAdapter
 from livekit.plugins import google, openai, sarvam, silero
 
@@ -61,6 +73,8 @@ from config import (
     MIN_ENDPOINTING_DELAY,
     GOOGLE_API_KEY,
     GROQ_API_KEY,
+    GROQ_MODEL,
+    GROQ_REASONING_EFFORT,
     LLM_MODEL,
     LLM_TEMPERATURE,
     SARVAM_STT_MODEL,
@@ -70,19 +84,23 @@ from config import (
     VAD_MIN_SILENCE_S,
     VAD_ACTIVATION_THRESHOLD,
     VAD_MIN_SPEECH_DURATION,
+    USER_AWAY_TIMEOUT_S,
 )
 from prompts import (
     GREETINGS,
     HOT_PERSONA,
+    LANG_NAMES,
     STYLE_NOTES,
     build_instructions,
 )
-from tools import AppointmentTools, build_dynamic_tools
+from tools import AppointmentTools, build_dynamic_tools, summarize_transcript
 
 from database import (
-    create_call, 
-    save_message, 
-    finish_call, 
+    create_call,
+    save_message,
+    finish_call,
+    save_call_summary,
+    set_call_phone,
     sync_knowledge_to_lancedb, 
     fetch_dynamic_prompt,
     fetch_assigned_tools,
@@ -97,21 +115,44 @@ METRICS_LOG = Path(__file__).parent / "logs" / "metrics.jsonl"
 
 # Confirmation phrase spoken the moment we switch language, IN that language.
 # These MUST exist for every supported language -- see set_language for why.
+# Spoken when the LLM returns nothing, so the caller never hears dead air.
+EMPTY_REPLY_FALLBACK: dict[str, str] = {
+    "en": "Sorry, could you say that once more?",
+    "hi": "माफ़ कीजिए, क्या आप एक बार फिर से बता सकते हैं?",
+}
+
 CONFIRMATIONS: dict[str, str] = {
     "en": "Perfect, we'll continue in English.",
     "hi": "ठीक है, अब हम हिंदी में बात करेंगे।",
 }
 
-def _should_trigger_llm(text: str) -> bool:
-    text = text.strip()
-    if len(text.split()) < 6:
-        return False
-    if text.endswith((",", "…", "um", "uh")):
-        return False
-    return True
-
-
 # --- pipeline wiring ---------------------------------------------------------
+def _build_llm():
+    """Groq first (fastest TTFT) with Gemini as fallback; Gemini alone if no Groq key."""
+    gemini = openai.LLM(
+        model=LLM_MODEL,
+        api_key=GOOGLE_API_KEY,
+        base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+        temperature=LLM_TEMPERATURE,
+        max_completion_tokens=MAX_TOKENS,
+    )
+    if not GROQ_API_KEY:
+        return gemini
+    groq = openai.LLM(
+        model=GROQ_MODEL,
+        api_key=GROQ_API_KEY,
+        base_url="https://api.groq.com/openai/v1",
+        temperature=LLM_TEMPERATURE,
+        max_completion_tokens=MAX_TOKENS,
+        reasoning_effort=GROQ_REASONING_EFFORT or NOT_GIVEN,
+        # No SDK retries: a 429 (rate limit) must fail over to Gemini at once,
+        # not sit in exponential backoff while the caller waits.
+        max_retries=0,
+    )
+    # Groq normally starts in ~0.3 s; if it hasn't within 1.5 s, use Gemini.
+    return FallbackAdapter([groq, gemini], attempt_timeout=3.0, max_retry_per_llm=0)
+
+
 def _build_session(
     language: str,
     job_ctx: JobContext,
@@ -128,34 +169,22 @@ def _build_session(
     tools_list = tools_instance.to_tools()
     tools_list.extend(build_dynamic_tools(dynamic_tool_specs))
     return AgentSession(
-        vad=silero.VAD.load(
+        vad=job_ctx.proc.userdata.get("vad") or silero.VAD.load(
             min_silence_duration=VAD_MIN_SILENCE_S,
             activation_threshold=VAD_ACTIVATION_THRESHOLD,
-            min_speech_duration=VAD_MIN_SPEECH_DURATION,
+           #min_speech_duration=VAD_MIN_SPEECH_DURATION,
+            # min_speech_duration removed: high activation_threshold (0.8) is sufficient
+            # noise rejection for telephony; removing this saves ~300ms TTFT.
             sample_rate=AUDIO_SAMPLE_RATE,
         ),
         stt=sarvam.STT(
             model=SARVAM_STT_MODEL,       # saaras:v3
             mode="codemix",               # keep English words spoken mid-sentence
-            language=bcp47,
+            language="unknown",           # auto-detect en/hi per utterance (no extra latency)
             sample_rate=AUDIO_SAMPLE_RATE,  # 8 kHz telephony
         ),
-        llm=FallbackAdapter([
-            # Fast path: Groq for low TTFT
-            openai.LLM(
-                model="openai/gpt-oss-20b",
-                api_key=GROQ_API_KEY,
-                base_url="https://api.groq.com/openai/v1",
-                temperature=LLM_TEMPERATURE,
-            ),
-            # Fallback: Gemini Flash‑Lite for capacity/quality
-            openai.LLM(
-                model=LLM_MODEL,
-                api_key=GOOGLE_API_KEY,
-                base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
-                temperature=LLM_TEMPERATURE,
-            )
-        ]),
+        llm=_build_llm(),
+        user_away_timeout=USER_AWAY_TIMEOUT_S,
         tts=sarvam.TTS(
             model=SARVAM_TTS_MODEL,        # bulbul:v3
             target_language_code=bcp47,
@@ -180,71 +209,160 @@ def _build_session(
 # --- agents ------------------------------------------------------------------
 
 
+def _with_caller(instructions: str, caller_phone: str | None) -> str:
+    """Let Maya offer the number the caller is dialling from."""
+    if not caller_phone:
+        return instructions
+    return (
+        f"{instructions}\n\nCALLER: dialling from {caller_phone}. When you need contact "
+        "details, ask whether the team should use this number; if yes, pass it as `phone`."
+    )
+
+
+def _compose_instructions(code: str, caller_phone: str | None, kb: "AppointmentTools | None") -> str:
+    """Persona + language rules, then the whole KB (small-KB fast path), then the
+    per-call caller line last so the long stable prefix stays cacheable."""
+    text = build_instructions(code, STYLE_NOTES[code])
+    if kb is not None and kb.full_kb:
+        text += "\n\nRelevant Zryth knowledge (the ONLY source of facts):\n" + kb.full_kb
+    return _with_caller(text, caller_phone)
+
+
+_DEVANAGARI = re.compile(r"[ऀ-ॿ]")
+_LATIN = re.compile(r"[A-Za-z]")
+
+
+def _detect_language(text: str) -> str | None:
+    """'hi' / 'en' from the transcript's script, or None when too short or mixed
+    to tell. Sarvam codemix writes Hindi in Devanagari and English in Latin, so
+    "Zryth के बारे में बताओ" -> hi and "tell me about your products" -> en."""
+    if len(text.split()) < 2:
+        return None  # "ok", "haan" -- not enough to switch on
+    dev, lat = len(_DEVANAGARI.findall(text)), len(_LATIN.findall(text))
+    if dev + lat < 4:
+        return None
+    ratio = dev / (dev + lat)
+    if ratio >= 0.5:
+        return "hi"
+    if ratio <= 0.15:
+        return "en"
+    return None
+
+
 class BaseMayaAgent(Agent):
-    """Base class providing language switching capabilities."""
-    
+    """Base class: language switching + knowledge prefetch before every reply."""
+
+    caller_phone: str | None = None
+    kb: AppointmentTools | None = None
+    code: str = "en"
+
+    async def llm_node(self, chat_ctx, tools, model_settings):
+        """Pass the LLM stream through. Gemini intermittently (~5%) returns an
+        empty reply: retry once silently, then fall back to a short line rather
+        than leave the caller in dead air."""
+        # Typed (console/text) input skips on_user_turn_completed, so re-check the
+        # caller's language here too -- otherwise a Hindi->English switch is missed.
+        last_user = next(
+            (m.text_content or "" for m in reversed(chat_ctx.items)
+             if getattr(m, "role", None) == "user" and m.text_content),
+            "",
+        )
+        lang = _detect_language(last_user)
+        if lang and lang != self.code:
+            await self._switch_language(lang)
+            chat_ctx = chat_ctx.copy()
+            chat_ctx.add_message(
+                role="system", content=f"The caller is now speaking {LANG_NAMES[lang]}; reply in {LANG_NAMES[lang]}."
+            )
+        for attempt in range(2):
+            produced = False
+            async for chunk in Agent.default.llm_node(self, chat_ctx, tools, model_settings):
+                if isinstance(chunk, str):
+                    produced = produced or bool(chunk.strip())
+                elif getattr(chunk, "delta", None) is not None:
+                    d = chunk.delta
+                    produced = produced or bool((d.content or "").strip() or d.tool_calls)
+                yield chunk
+            if produced:
+                return
+            log.warning("LLM returned an empty reply (attempt %d)", attempt + 1)
+        yield EMPTY_REPLY_FALLBACK.get(self.code, EMPTY_REPLY_FALLBACK["en"])
+
+    async def on_user_turn_completed(
+        self, turn_ctx: agents.llm.ChatContext, new_message: agents.llm.ChatMessage
+    ) -> None:
+        """Inject relevant Zryth knowledge so the LLM answers in ONE round trip."""
+        text = new_message.text_content or ""
+        # Drop near-silent noise ("Hmm", "Oh bro" at ~0.05 confidence) instead of answering it.
+        conf = getattr(new_message, "transcript_confidence", None)
+        if conf is not None and conf < 0.15 and len(text.split()) <= 3:
+            log.info("Ignoring low-confidence transcript %r (%.2f)", text, conf)
+            raise agents.StopResponse()
+        lang = _detect_language(text)
+        if lang and lang != self.code:
+            await self._switch_language(lang)
+            turn_ctx.add_message(
+                role="system", content=f"The caller is now speaking {LANG_NAMES[lang]}; reply in {LANG_NAMES[lang]}."
+            )
+        if self.kb is None:
+            return
+        if self.kb.full_kb:
+            # Whole KB is already in the system prompt: nothing to wait for. Run
+            # the vector lookup in the background only to log knowledge gaps.
+            asyncio.create_task(self.kb.retrieve_for_turn(text))
+            return
+        # Short follow-ups ("what's its price?") need the previous question for context.
+        if len(text.split()) < 6:
+            prev = [
+                m.text_content for m in turn_ctx.items
+                if getattr(m, "role", None) == "user" and m is not new_message and m.text_content
+            ]
+            if prev:
+                text = f"{prev[-1]} {text}"
+        chunks = await self.kb.retrieve_for_turn(text)
+        if chunks:
+            turn_ctx.add_message(
+                role="assistant",
+                content="Relevant Zryth knowledge for the caller's next message:\n" + "\n\n".join(chunks),
+            )
+
+    async def _switch_language(self, code: str) -> None:
+        """Reply language + TTS voice follow the caller; STT keeps auto-detecting."""
+        self.code = code
+        tts = self.session.tts
+        if tts is not None and hasattr(tts, "update_options"):
+            tts.update_options(target_language_code=BCP47[code])
+        await self.update_instructions(_compose_instructions(code, self.caller_phone, self.kb))
+        log.info("language -> %s", code)
+
     @function_tool
-    async def set_language(self, context: RunContext, language: str) -> None:
-        """Switch the whole conversation to the caller's preferred language.
+    async def set_language(self, context: RunContext, language: str):
+        """Switch the reply language when the caller explicitly asks for one.
 
         Args:
             language: one of en, hi.
-        """     
+        """
         code = language.strip().lower()
         if code not in SUPPORTED_LANGUAGES:
             return f"Language '{language}' is not supported. Supported: {', '.join(SUPPORTED_LANGUAGES)}."
-
-        # Idempotency: skip if already on the same language agent
-        current = context.session.current_agent
-        if isinstance(current, LangAgent) and current.code == code:
-            return {"status": "already_active", "language": code}
-
-        try:
-            context.session.update_agent(LangAgent(code))
-        except Exception:
-            log.exception("update_agent failed for language=%s", code)
-            return {"status": "failed", "language": code}
-
+        if code != self.code:
+            await self._switch_language(code)
         return {"status": "switched", "language": code}
 
 
 class GreeterAgent(BaseMayaAgent):
     """Greets the caller in English and detects their language."""
 
-    def __init__(self) -> None:
-        instructions = (
-            HOT_PERSONA
-            + "\n\nYou are speaking with the caller in English. "
-            "Do NOT change language based on a single word or mispronunciation. "
-            "ONLY call the set_language tool with the language code (en, hi) if the caller explicitly asks to change the language or speaks multiple full sentences in a different language."
-        )
-        super().__init__(instructions=instructions)
-
-
-class LangAgent(BaseMayaAgent):
-    """One agent parameterised by language code; STT + TTS locked to it."""
-
-    def __init__(self, code: str) -> None:
-        bcp47 = BCP47[code]
+    def __init__(
+        self, caller_phone: str | None = None, kb: AppointmentTools | None = None
+    ) -> None:
+        # Full per-language prompt (incl. call-ending + tool-result rules) --
+        # most English calls never leave the greeter.
         super().__init__(
-            instructions=build_instructions(code, STYLE_NOTES[code]),
-            # Override the session's STT/TTS to relock the language for this agent.
-            stt=sarvam.STT(
-                model=SARVAM_STT_MODEL,
-                mode="codemix",
-                language=bcp47,
-                sample_rate=AUDIO_SAMPLE_RATE,
-            ),
-            tts=sarvam.TTS(
-                model=SARVAM_TTS_MODEL,
-                target_language_code=bcp47,
-                speaker=SARVAM_TTS_VOICE,
-                pace=1.10,
-		min_buffer_size=30,
-    		max_chunk_length=80,
-            ),
+            instructions=_compose_instructions("en", caller_phone, kb)
         )
-        self.code = code
+        self.caller_phone = caller_phone
+        self.kb = kb
 
 
 # --- metrics -> JSONL --------------------------------------------------------
@@ -279,9 +397,18 @@ def _make_metrics_handler(call_id: str):
 
 
 # --- entrypoint --------------------------------------------------------------
-async def entrypoint(ctx: JobContext) -> None:
-    await ctx.connect()
+def prewarm(proc) -> None:
+    """Runs once per worker process before any call: load the VAD model and the
+    OpenAI SDK here so the first call doesn't block the event loop (~0.6 s + ~1.8 s)."""
+    import openai.resources  # noqa: F401  (lazy import otherwise happens mid-call)
+    proc.userdata["vad"] = silero.VAD.load(
+        min_silence_duration=VAD_MIN_SILENCE_S,
+        activation_threshold=VAD_ACTIVATION_THRESHOLD,
+        sample_rate=AUDIO_SAMPLE_RATE,
+    )
 
+
+async def entrypoint(ctx: JobContext) -> None:
     # Try to extract phone from room name or metadata
     phone = None
     if ctx.room.metadata and "+" in ctx.room.metadata:
@@ -311,15 +438,9 @@ async def entrypoint(ctx: JobContext) -> None:
         ctx.room.name,
     )
     
-    dynamic_greeting = await asyncio.to_thread(
-        fetch_dynamic_prompt,
-        "greeting_prompt",
-        GREETINGS[DEFAULT_LANGUAGE]
-    )
-    
-    dynamic_tool_specs = await asyncio.to_thread(
-        fetch_assigned_tools,
-        "maya_v2"
+    dynamic_greeting, dynamic_tool_specs = await asyncio.gather(
+        asyncio.to_thread(fetch_dynamic_prompt, "greeting_prompt", GREETINGS[DEFAULT_LANGUAGE]),
+        asyncio.to_thread(fetch_assigned_tools, "maya_v2"),
     )
 
     session, tools_instance = _build_session(
@@ -328,33 +449,11 @@ async def entrypoint(ctx: JobContext) -> None:
         call_id,
         dynamic_tool_specs,
     )
+    await tools_instance.prepare_kb()
     session.on(
         "metrics_collected",
         _make_metrics_handler(ctx.room.name),
     )
-
-    async def _trigger_early_reply(partial_text: str, session: "AgentSession") -> None:
-        """
-        Trigger a reply early to mask STT latency without duplicating user messages.
-        """
-        try:
-            # Do NOT manually edit chat_ctx here; let the framework manage messages.
-            # Just trigger generation based on current context.
-            if hasattr(session, "generate_reply"):
-                await session.generate_reply()
-            elif hasattr(session, "_trigger_agent"):
-                session._trigger_agent()
-        except Exception as e:
-            log.warning(f"Could not trigger early reply: {e}")
-
-    def _on_stt_interim(event) -> None:
-        text = getattr(event, "text", "") or ""
-        if not _should_trigger_llm(text):
-            return
-        asyncio.create_task(_trigger_early_reply(text, session))
-
-    # Subscribe to interim STT events
-    session.on("stt_interim_transcript", _on_stt_interim)
 
     # Save customer and Maya messages.
     def on_conversation_item(event) -> None:
@@ -368,8 +467,6 @@ async def entrypoint(ctx: JobContext) -> None:
 
         if role == "user":
             speaker = "customer"
-            # Reset per-turn tool counters on each new user utterance
-            tools_instance.reset_turn_counters()
         elif role == "assistant":
             speaker = "maya"
         else:
@@ -407,23 +504,114 @@ async def entrypoint(ctx: JobContext) -> None:
         except Exception:
             log.exception("Failed to finish Supabase call")
 
+        # Post-call summary / intent / outcome for the dashboard and KB review.
+        lines = []
+        for item in session.history.items:
+            role = getattr(item, "role", None)
+            text = getattr(item, "text_content", None)
+            if role in ("user", "assistant") and text:
+                lines.append(f"{'Caller' if role == 'user' else 'Maya'}: {text}")
+        result = await summarize_transcript("\n".join(lines), LLM_MODEL)
+        if result:
+            try:
+                await asyncio.to_thread(
+                    save_call_summary,
+                    call_id,
+                    result.get("summary", ""),
+                    result.get("intent"),
+                    result.get("outcome"),
+                )
+            except Exception:
+                log.exception("Failed to save call summary")
+
     ctx.add_shutdown_callback(on_shutdown)
 
+    _GOODBYE_MARKERS = ("goodbye", "bye", "din shubh", "दिन शुभ", "have a great day")
+
+    # Caller went silent: check in once, then end the call on a second timeout.
+    _away_prompts = [0]
+
+    def on_user_state_changed(ev) -> None:
+        if ev.new_state != "away" or tools_instance.is_ending or tools_instance.is_transferring:
+            return
+        _away_prompts[0] += 1
+        # Maya already said goodbye but the LLM skipped end_call: just hang up.
+        last = next(
+            (m.text_content or "" for m in reversed(session.history.items)
+             if getattr(m, "role", None) == "assistant" and m.text_content),
+            "",
+        ).lower()
+        if any(w in last for w in _GOODBYE_MARKERS):
+            tools_instance.is_ending = True
+            tools_instance.on_end_requested()
+            asyncio.create_task(_hang_up())
+            return
+        if _away_prompts[0] == 1:
+            session.generate_reply(
+                instructions="The caller has gone quiet. Briefly and warmly ask if they are still there."
+            )
+        else:
+            tools_instance.is_ending = True
+            tools_instance.on_end_requested()
+            session.generate_reply(
+                instructions="The caller is still silent. Say a short, polite goodbye and invite them to call back."
+            )
+
+    session.on("user_state_changed", on_user_state_changed)
+    
+    # Hang up once end_call was requested AND the goodbye has finished playing
+    # (speaking -> listening). A fallback timer covers a missing goodbye.
+    _hangup = {"spoke_goodbye": False, "started": False}
+
+    async def _hang_up() -> None:
+        if _hangup["started"]:
+            return
+        _hangup["started"] = True
+        # Close the session first so it stops streaming events into a room we're
+        # about to delete (otherwise: "failed to send session event").
+        try:
+            await session.aclose()
+        except Exception:
+            log.exception("session.aclose failed during hang-up")
+        try:
+            await ctx.api.room.delete_room(lk_api.DeleteRoomRequest(room=ctx.room.name))
+        except Exception:
+            log.exception("delete_room failed; shutting down job instead")
+        ctx.shutdown(reason="call ended by agent")
+
+    async def _hang_up_fallback() -> None:
+        await asyncio.sleep(12)
+        await _hang_up()
+
+    def on_agent_state_changed(ev) -> None:
+        if not tools_instance.is_ending:
+            return
+        if ev.new_state == "speaking":
+            _hangup["spoke_goodbye"] = True
+        elif ev.new_state == "listening" and _hangup["spoke_goodbye"]:
+            asyncio.create_task(_hang_up())
+
+    session.on("agent_state_changed", on_agent_state_changed)
+    tools_instance.on_end_requested = lambda: asyncio.create_task(_hang_up_fallback())
+
+    await ctx.connect()
+
+    # Real caller ID from the SIP participant (falls back to the room-name guess).
+    try:
+        participant = await asyncio.wait_for(ctx.wait_for_participant(), timeout=3.0)
+        sip_phone = participant.attributes.get("sip.phoneNumber")
+        if sip_phone:
+            phone = sip_phone
+            asyncio.create_task(asyncio.to_thread(set_call_phone, call_id, sip_phone))
+    except Exception:
+        log.warning("Could not read SIP caller number; continuing without it")
+
     await session.start(
-        agent=GreeterAgent(),
+        agent=GreeterAgent(caller_phone=phone, kb=tools_instance),
         room=ctx.room,
     )
 
-    # Save Maya's opening greeting.
-    try:
-        save_message(
-            call_id=call_id,
-            speaker="maya",
-            message=dynamic_greeting,
-        )
-    except Exception:
-        log.exception("Failed to save opening greeting")
-
+    # The greeting is persisted by on_conversation_item like every other turn.
     await session.say(dynamic_greeting)
 
 
@@ -448,6 +636,7 @@ if __name__ == "__main__":
 
     import threading
     import time
+    from database import realtime_sync_loop
 
     def heartbeat_loop():
         while True:
@@ -462,13 +651,20 @@ if __name__ == "__main__":
                 log.error(f"Heartbeat failed: {e}")
             time.sleep(10)
 
-    t = threading.Thread(target=heartbeat_loop, daemon=True)
-    t.start()
+    def realtime_sync_worker():
+        asyncio.run(realtime_sync_loop())
+
+    t1 = threading.Thread(target=heartbeat_loop, daemon=True)
+    t1.start()
+
+    t2 = threading.Thread(target=realtime_sync_worker, daemon=True)
+    t2.start()
 
     try:
         agents.cli.run_app(
             WorkerOptions(
                 entrypoint_fnc=entrypoint,
+                prewarm_fnc=prewarm,
                 agent_name=os.getenv("AGENT_NAME", "maya"),
             )
         )

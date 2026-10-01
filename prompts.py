@@ -1,10 +1,9 @@
 """System prompts and per-language copy for Maya, the Zryth AI solutions voice assistant.
 
-Latency note: on a phone call the system prompt is the single biggest latency
-killer. Keep HOT_PERSONA SHORT (a couple hundred chars, well under ~800). Do NOT
-Keep HOT_PERSONA SHORT. Maya captures leads and answers only with approved business information or available tools.
-through the function tools in tools.py. A short prompt = fewer input tokens =
-faster LLM time-to-first-token every single turn.
+HOT_PERSONA is capped at 800 chars (enforced by the self-check below): fewer
+input tokens = faster time-to-first-token on every turn. It holds behaviour
+only -- NO company facts. All facts come from the knowledge base, injected per
+turn as "Relevant Zryth knowledge" (agent.BaseMayaAgent.on_user_turn_completed).
 """
 
 from __future__ import annotations
@@ -17,21 +16,19 @@ GRAMMAR_DIR = Path(__file__).parent / "grammar"
 
 # The one persona prompt, shared by every language agent. Keep it tight.
 HOT_PERSONA = """
-You are Maya, friendly voice assistant for Zryth. Zryth builds industry-specific Software as a Service (never say "SaaS") in Noida Sector 132.
-RULES:
-1. Keep replies to 1-2 short spoken sentences. Start with natural fillers like "Sure" or "Got it".
-2. For specific questions about Zryth's products, features, pricing, or team, call `search_knowledge`. **CRITICAL: Before answering, verify the returned text actually describes the specific product requested. If it doesn't, politely state that Zryth does not offer it.**
-3. You must ONLY answer questions related to Zryth. Politely refuse unrelated topics.
-4. Tools available: `capture_lead`, `book_consultation`, `transfer_to_human`, `end_call`. **CRITICAL: Before booking a consultation or capturing a lead, you MUST ask the caller for their name and phone number. Do not call the tool with blank information.**
-5. For contact info, ask if the team should use this number or an alternate.
+You are Maya, Zryth's phone assistant. Reply in 1-2 short spoken sentences, max 25 words.
+FACTS: Use ONLY the "Relevant Zryth knowledge" you are given. Never invent or guess products, features, clients, numbers, dates, or people. If the knowledge doesn't answer it, say the Zryth team will confirm, and offer to take their name and number. Never say Zryth doesn't offer something.
+PRICES: Never quote a price or cost, even if one appears in the knowledge; say the Zryth team will share pricing.
+CUSTOM WORK: For custom software, AI agents, or apps, offer a consultation with the Zryth team.
+Off-topic (not Zryth): politely say you can only help with Zryth.
+TOOLS: Ask the caller's name and phone before capture_lead or book_consultation; never pass blank details. Never say "lead" or "SaaS".
 """
 
 
-CONVERSATION_ENDING = """
-CONVERSATION ENDING:
-If the caller says things like "no", "no thanks", "that's all", "bye", treat the conversation as complete.
-CRITICAL RULE: Call `end_call` to finish; do NOT generate your own goodbye.
-"""
+CONVERSATION_ENDING = (
+    'ENDING: When the caller is done ("no thanks", "that\'s all", "bye"), '
+    "say a brief goodbye AND call end_call in that same reply. Never say goodbye without calling end_call."
+)
 
 # Human-readable language names, used in the per-language instruction line.
 LANG_NAMES: dict[str, str] = {
@@ -42,7 +39,7 @@ LANG_NAMES: dict[str, str] = {
 # Tiny per-language style note appended to the persona. Kept short on purpose.
 STYLE_NOTES: dict[str, str] = {
     "en": "Speak clear, simple English.",
-    "hi": "Reply in natural, conversational Hindi (Devanagari script), not formal textbook Hindi.",
+    "hi": "Write ONLY in Devanagari script, never romanized Hindi (product/brand names may stay in English). Use natural, conversational Hindi, not textbook Hindi. You are female: say सकती हूँ, करूँगी, never सकता, करूँगा.",
 }
 
 # What Maya says first when a call connects, per language.
@@ -82,12 +79,16 @@ def build_instructions(language: str, script: str, include_grammar: bool = False
     if you need to shave the last few ms. See docs/04-latency.md.
     """
     name = LANG_NAMES.get(language, language)
-    tool_chaining_rules = (
-        "TOOL RESULTS: After any tool returns data, always speak a response to the user immediately. "
-        "Translate English tool output into the conversation language before speaking. "
-        "After set_language succeeds, answer the user's pending question in the new language without acknowledging the switch."
+    base = (
+        f"{HOT_PERSONA}"
+        f"LANGUAGE: Default to {name}. {script}"
+        + (f" Translate English knowledge or tool output into {name}." if language != "en" else "")
+        + "\n"
+        "This overrides the default: ALWAYS reply in the language of the caller's LATEST "
+        "message (English or Hindi), without mentioning it. Call set_language only if the caller asks for a language.\n"
+        "After any tool returns, always reply to the caller.\n"
+        f"{CONVERSATION_ENDING}"
     )
-    base = f"{HOT_PERSONA}\nLanguage: Always respond in {name}. {script} Even when tool results are in English, translate them and speak in {name}.\nLanguage switching: Only call set_language with the code (en, hi) if the caller explicitly asks to change the language or speaks multiple full sentences in a different language. Do NOT switch language based on a single word.\n\n{tool_chaining_rules}\n\n{CONVERSATION_ENDING}"
     grammar = load_grammar(language) if include_grammar else ""
     return f"{base}\n\n{grammar}" if grammar else base
 
@@ -95,15 +96,15 @@ def build_instructions(language: str, script: str, include_grammar: bool = False
 if __name__ == "__main__":
     # Self-check: the persona must stay short (latency) and every language must
     # have parallel copy so nothing goes silent after a language switch.
-    assert len(HOT_PERSONA) <= 1500, f"HOT_PERSONA too long: {len(HOT_PERSONA)} chars"
+    assert len(HOT_PERSONA) <= 800, f"HOT_PERSONA too long: {len(HOT_PERSONA)} chars (cap 800)"
     for _code in LANG_NAMES:
         assert _code in STYLE_NOTES, f"missing STYLE_NOTES[{_code}]"
         assert _code in GREETINGS, f"missing GREETINGS[{_code}]"
     assert "Zryth" in build_instructions("hi", STYLE_NOTES["hi"])
-    # Grammar sheets should exist and get appended when present.
+    # Grammar sheets are optional; when present they must get appended.
     for _code in LANG_NAMES:
-        assert load_grammar(_code), f"missing/empty grammar sheet for {_code}"
-    _with = build_instructions("ta", STYLE_NOTES["ta"], include_grammar=True)
-    _without = build_instructions("ta", STYLE_NOTES["ta"], include_grammar=False)
-    assert len(_with) > len(_without), "grammar sheet was not appended"
-    print(f"prompts.py self-check passed (HOT_PERSONA={len(HOT_PERSONA)} chars, grammar wired)")
+        if load_grammar(_code):
+            _with = build_instructions(_code, STYLE_NOTES[_code], include_grammar=True)
+            _without = build_instructions(_code, STYLE_NOTES[_code], include_grammar=False)
+            assert len(_with) > len(_without), f"grammar sheet for {_code} was not appended"
+    print(f"prompts.py self-check passed (HOT_PERSONA={len(HOT_PERSONA)} chars)")

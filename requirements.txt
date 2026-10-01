@@ -1,11 +1,13 @@
 # voice-agent-starter-kit -- Python dependencies for the agent worker.
-# Pinned loosely (>=) so you get fixes; pin exact versions before you deploy.
+# Floors = versions this code is verified against (it uses LiveKit Agents 1.8 APIs:
+# TurnHandlingOptions, user_away_timeout, llm_node, WarmTransferTask). Keep all
+# livekit-agents / livekit-plugins-* on the SAME minor version.
 
 # LiveKit Agents runtime (v1.x owns the audio loop).
-livekit-agents>=1.0.0
+livekit-agents>=1.8.1,<2
 
 # Pipeline plugins.
-livekit-plugins-sarvam>=1.4.2  # Sarvam Saaras STT + Bulbul TTS (Indian languages).
+livekit-plugins-sarvam>=1.8.1,<2  # Sarvam Saaras STT + Bulbul TTS (Indian languages).
                                # The floor is not cosmetic. bulbul:v3 rejects the
                                # `pitch` and `loudness` fields outright; builds before
                                # 1.2.9 send them unconditionally and so 400 on every
@@ -13,15 +15,15 @@ livekit-plugins-sarvam>=1.4.2  # Sarvam Saaras STT + Bulbul TTS (Indian language
                                # bulbul:v3 speakers, including the default `simran`;
                                # before it, the speaker check does not know them.
                                # Verified against 1.5.8 and 1.7.1.
-livekit-plugins-silero        # Silero VAD (end-of-utterance detection)
-livekit-plugins-google        # Google Gemini LLM
-livekit-plugins-openai        # OpenAI / Groq LLM
+livekit-plugins-silero>=1.8.1,<2  # Silero VAD (end-of-utterance detection)
+livekit-plugins-google>=1.8.1,<2  # Google Gemini LLM
+livekit-plugins-openai>=1.8.1,<2  # OpenAI / Groq LLM
 
 # LiveKit server/SIP API client (dispatch rules, SIP transfer, room admin).
-livekit-api
+livekit-api>=1.2.1
 
 # Google GenAI SDK (used by the google plugin).
-google-genai>=0.1.2
+google-genai>=2.0
 
 # Config, HTTP, and TLS certs.
 python-dotenv
@@ -29,6 +31,10 @@ httpx
 certifi
 
 # RAG & Embeddings
-google-genai
-supabase
-lancedb
+supabase>=2.31
+lancedb>=0.38
+pypdf>=6.0  # knowledge PDF/TXT ingestion (knowledge_ingest.py)
+
+# Knowledge webhook service (webhook_server.py)
+fastapi>=0.110
+uvicorn>=0.30

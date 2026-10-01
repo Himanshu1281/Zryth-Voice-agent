@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import logging
 import asyncio
+import re
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -13,9 +15,10 @@ from functools import lru_cache
 
 from google import genai
 from livekit.agents import JobContext, RunContext, function_tool
+from livekit.agents.beta.workflows import WarmTransferTask
 
 from config import DEFAULT_TRANSFER_NUMBER
-from database import _init_supabase, update_call_lead
+from database import _init_supabase, log_knowledge_gap, update_call_lead
 from dynamic_executor import execute_tool_call
 
 # Initialize the Gemini client for embeddings
@@ -60,49 +63,183 @@ def _save_lead(lead: dict) -> None:
     )
 
 
-# Per-instance call tracking to rate-limit search_knowledge
-_SEARCH_RATE_LIMIT = 4  # max search calls per turn
+# Knowledge prefetch tuning (see AppointmentTools.retrieve_for_turn).
+# gemini-embedding-2 cosine scores on this KB: on-topic ~0.54-0.65, off-topic
+# ~0.43-0.53 -- too close for a hard cutoff. So we always hand the LLM the top
+# chunks above a low floor (the prompt forbids using anything they don't
+# support) and only treat a weak best match as a knowledge gap.
+_RELEVANCE_FLOOR = 0.40    # below this a chunk is pure noise
+_GAP_THRESHOLD = 0.55      # best match below this = KB probably can't answer
+_MIN_GAP_WORDS = 3         # don't log fragments as knowledge gaps
+_RETRIEVAL_TIMEOUT_S = 1.5 # never hold the reply longer than this
+# Pure small talk: no lookup needed.
+_SMALL_TALK = re.compile(
+    r"^(?:hi|hello|hey|hii|ok|okay|yes|yeah|yep|no|nope|thanks|thank you|bye|"
+    r"hmm+|haan|ha|nahi|theek hai|accha|achha|namaste|हाँ|नहीं|ठीक है|अच्छा|नमस्ते)[\s.!?,]*$",
+    re.I,
+)
+
+# STT mis-hearings of Zryth names -> spelling used in the knowledge base.
+# Sarvam STT has no keyterm boosting, so we normalise before retrieval.
+_NAME_ALIASES = [
+    (re.compile(r"\b(?:oswal|oswall|osval|oswaal)\b", re.I), "Oswaal"),
+    (re.compile(r"\b(?:zyrth|zrith|zerith|zareth|zarith|zarid|zerid|zaret)\b", re.I), "Zryth"),
+]
 
 
-@lru_cache(maxsize=256)
-def _cached_search(query: str) -> tuple[str, ...]:
-    res = llm_client.models.embed_content(
-        model='gemini-embedding-2',
-        contents=query,
-    )
-    emb = res.embeddings[0].values
+_PRICING_Q = re.compile(
+    r"\b(?:price|prices|pricing|cost|costs|charge|charges|fee|fees|rate|rates|quote|budget|"
+    r"how much|kitna|kitne|keemat|daam|paisa|paise)\b|कीमत|दाम|कितना|कितने|शुल्क",
+    re.I,
+)
 
-    # Check globally initialized db connection instead of reconnecting every time
+
+def normalise_names(text: str) -> str:
+    for pattern, canonical in _NAME_ALIASES:
+        text = pattern.sub(canonical, text)
+    return text
+
+
+_SEARCH_TOP_K = 3
+
+
+def _vector_search(emb: list[float]) -> list[dict]:
+    """Blocking LanceDB lookup. Never re-syncs mid-call: the startup sync and the
+    realtime_sync_loop keep the table fresh; a missing table just means no results."""
     global _cached_db
+    import lancedb
+    from database import LANCEDB_PATH
+
     if _cached_db is None:
-        import lancedb
-        import os
-        from database import LANCEDB_PATH
         if not os.path.exists(LANCEDB_PATH):
-            return tuple()
+            return []
         _cached_db = lancedb.connect(LANCEDB_PATH)
 
-    db = _cached_db
-    if "knowledge" not in db.table_names():
-        # Table missing — try invalidating the cached connection and reconnecting once
-        log.warning("'knowledge' table not found, re-syncing LanceDB...")
-        _cached_db = None
-        from database import sync_knowledge_to_lancedb
-        sync_knowledge_to_lancedb()
-        import lancedb as _lancedb
-        from database import LANCEDB_PATH
-        _cached_db = _lancedb.connect(LANCEDB_PATH)
-        db = _cached_db
+    if "knowledge" not in _cached_db.table_names():
+        log.warning("'knowledge' table not found in LanceDB; returning no results")
+        _cached_db = None  # reconnect next time, after the background sync lands
+        return []
+
+    table = _cached_db.open_table("knowledge")
+    return table.search(emb).metric("cosine").limit(_SEARCH_TOP_K).to_list()
+
+
+# Small-KB fast path: while the whole knowledge base fits in this many chars
+# (~6k tokens), it goes into the system prompt and no per-turn retrieval runs.
+# That removes the ~600 ms Gemini embedding call from every turn (measured:
+# Gemini TTFT 1.0 s full-KB vs 1.6 s embed+search+LLM). Beyond this size we
+# switch to per-turn vector retrieval automatically.
+KB_FULL_MAX_CHARS = int(os.getenv("KB_FULL_MAX_CHARS", "1500"))
+
+
+def load_full_kb() -> str | None:
+    """Whole KB from the local LanceDB copy (kept fresh by the realtime sync),
+    or None if it is empty/missing or too large for the prompt."""
+    import lancedb
+    from database import LANCEDB_PATH
+
+    try:
+        if not os.path.exists(LANCEDB_PATH):
+            return None
+        db = lancedb.connect(LANCEDB_PATH)
         if "knowledge" not in db.table_names():
-            return tuple()
-        
-    table = db.open_table("knowledge")
-    results = table.search(emb).limit(3).to_list()
+            return None
+        rows = db.open_table("knowledge").to_arrow().select(["id", "content"]).to_pylist()
+    except Exception:
+        log.exception("Could not load knowledge base for prompt; using retrieval")
+        return None
+    text = "\n\n".join(r["content"] for r in sorted(rows, key=lambda r: r["id"]))
+    if not text or len(text) > KB_FULL_MAX_CHARS:
+        return None
+    return text
+
+
+_search_cache = {}
+_search_cache_lock = asyncio.Lock()
+
+async def _cached_search(query: str) -> tuple[tuple[str, ...], float]:
+    """Return (top chunks above the relevance floor, best similarity score)."""
+    async with _search_cache_lock:
+        if query in _search_cache:
+            return _search_cache[query]
+
+    try:
+        res = await asyncio.wait_for(
+            asyncio.to_thread(
+                lambda: llm_client.models.embed_content(
+                    model='gemini-embedding-2',
+                    contents=query,
+                )
+            ),
+            timeout=3.0,
+        )
+    except asyncio.TimeoutError:
+        log.warning("Gemini embedding timed out for query: %s", query)
+        return tuple(), 0.0
+
+    emb = res.embeddings[0].values
+
+    # LanceDB calls are synchronous -- run them off the event loop so audio never stalls.
+    results = await asyncio.to_thread(_vector_search, emb)
+
+    scored = [
+        (1.0 - row["_distance"], row["content"])
+        for row in results
+        if row.get("_distance") is not None
+    ]
+    best = max((sc for sc, _ in scored), default=0.0)
+    # Chunks are sentence-aligned and <= ~1000 chars; don't cut them mid-sentence.
+    result = (tuple(c for sc, c in scored if sc >= _RELEVANCE_FLOOR), best)
     
-    if not results:
-        return tuple()
-    # Truncate each chunk to keep LLM output manageable
-    return tuple([row['content'][:300] for row in results])
+    async with _search_cache_lock:
+        _search_cache[query] = result
+        if len(_search_cache) > 256:
+            # simple prune
+            _search_cache.pop(next(iter(_search_cache)))
+        
+    return result
+
+
+_SUMMARY_PROMPT = (
+    "Summarise this phone call between Maya (Zryth's voice assistant) and a caller. "
+    'Return JSON only: {"summary": "2-3 sentences", "intent": "short label, e.g. '
+    'product_enquiry / pricing / custom_dev / support / other", "outcome": "one of '
+    'lead_captured, consultation_booked, transferred, answered, unresolved, dropped"}.\n\n'
+)
+
+
+async def summarize_transcript(transcript: str, model: str) -> dict | None:
+    """Post-call summary via Gemini. Returns None on any failure."""
+    if llm_client is None or not transcript.strip():
+        return None
+    try:
+        res = await asyncio.wait_for(
+            asyncio.to_thread(
+                lambda: llm_client.models.generate_content(
+                    model=model,
+                    contents=_SUMMARY_PROMPT + transcript,
+                    config={
+                        "response_mime_type": "application/json",
+                        "automatic_function_calling": {"disable": True},
+                    },
+                )
+            ),
+            timeout=20.0,
+        )
+        return json.loads(res.text)
+    except Exception:
+        log.exception("Call summary generation failed")
+        return None
+
+
+def _with_preferred_slot(
+    requirement: Optional[str], date: Optional[str], time: Optional[str]
+) -> Optional[str]:
+    """Append the preferred slot only when the caller actually gave one."""
+    slot = " ".join(p for p in (date, time) if p)
+    if not slot:
+        return requirement
+    return f"{requirement} (Preferred: {slot})" if requirement else f"Preferred: {slot}"
 
 
 def build_dynamic_tools(tool_specs: list[dict]) -> list:
@@ -145,8 +282,20 @@ class AppointmentTools:
     def __init__(self, job_ctx: JobContext | None = None, call_id: str | None = None) -> None:
         self.job_ctx = job_ctx
         self.call_id = call_id
-        self._search_calls_this_turn: int = 0  # rate-limit counter
-        self._shutdown_task: asyncio.Task | None = None  # track pending shutdown
+        self.is_ending = False
+        self.is_transferring = False
+        # Set by the entrypoint; arms the hang-up fallback timer.
+        self.on_end_requested = None
+        # Whole KB for the system prompt (small-KB fast path); None = retrieve per turn.
+        self.full_kb: str | None = None
+
+    async def prepare_kb(self) -> None:
+        """Load the KB once per call (local disk, a few ms)."""
+        self.full_kb = await asyncio.to_thread(load_full_kb)
+        log.info(
+            "knowledge mode: %s",
+            f"full KB in prompt ({len(self.full_kb)} chars)" if self.full_kb else "per-turn retrieval",
+        )
 
     def to_tools(self) -> list:
         return [
@@ -154,12 +303,7 @@ class AppointmentTools:
             self.book_consultation,
             self.transfer_to_human,
             self.end_call,
-            self.search_knowledge,
         ]
-
-    def reset_turn_counters(self) -> None:
-        """Reset per-turn rate-limit counters. Call this on each new user utterance."""
-        self._search_calls_this_turn = 0
 
     @function_tool
     async def capture_lead(
@@ -187,6 +331,12 @@ class AppointmentTools:
                 automate, integrate, or improve with AI/software.
         """
 
+        if not name or not name.strip():
+            return {
+                "status": "failed",
+                "message": "Name is required. Please ask the caller for their name before proceeding.",
+            }
+
         if self.call_id:
             await asyncio.to_thread(
                 update_call_lead,
@@ -205,47 +355,45 @@ class AppointmentTools:
             "message": "The customer enquiry has been recorded successfully.",
         }
 
-    @function_tool
-    async def search_knowledge(
-        self,
-        context: RunContext,
-        query: str,
-    ) -> str:
-        """Search the Zryth knowledge base for product details, features, or pricing.
-
-        Call this ONLY when ALL of these are true:
-        - The user's utterance is a complete, finished sentence (not a fragment).
-        - It specifically concerns Zryth's products, services, team, or pricing.
-        Example — CALL: "What does Oswal AI do?" / "Tell me about Zryth's products."
-        Example — DO NOT CALL: "what" / "umm tell me" / silence / mid-sentence fragments.
-
-        Args:
-            query: 3+ word descriptive phrase, e.g. "Oswal AI features" or
-                   "What products does Zryth make?".
-        """
-        # Guard: reject empty queries
-        if not query or len(query.strip()) == 0:
-            return "Please wait for the user to complete their question before searching."
-        
-        # Rate-limit: reset counter at start of each tool call, then check
-        self._search_calls_this_turn += 1
-        if self._search_calls_this_turn > _SEARCH_RATE_LIMIT:
-            log.warning("search_knowledge rate limit hit (%d calls this turn)", self._search_calls_this_turn)
-            return "You have already searched enough. Please answer the user with what you know."
-        
-        log.info(f"search_knowledge -> querying for: {query}")
-        
+    async def _log_gap(self, query: str) -> None:
+        """Fire-and-forget: record an unanswered question so the KB can be extended."""
         try:
-            results_content = await asyncio.to_thread(_cached_search, query)
-            
-            if not results_content:
-                return "No relevant information found in the knowledge base."
-                
-            return "\n\n".join(results_content)
-            
-        except Exception as e:
-            log.error(f"search_knowledge error: {e}")
-            return "An error occurred while searching the knowledge base."
+            await asyncio.to_thread(log_knowledge_gap, self.call_id, query)
+        except Exception:
+            log.exception("Failed to log knowledge gap: %s", query)
+
+    async def retrieve_for_turn(self, text: str) -> tuple[str, ...]:
+        """Prefetch knowledge for the caller's finished utterance (RAG before the LLM).
+
+        Runs in on_user_turn_completed so the answer needs ONE LLM round trip
+        instead of tool-call -> search -> second LLM call (~1.3 s saved).
+        Pure small talk ("hello", "okay") is skipped. Questions whose best match
+        is weak are logged as knowledge gaps.
+        """
+        text = normalise_names((text or "").strip())
+        if not text or _SMALL_TALK.match(text):
+            return tuple()
+        t0 = time.perf_counter()
+        try:
+            chunks, best = await asyncio.wait_for(_cached_search(text), timeout=_RETRIEVAL_TIMEOUT_S)
+        except asyncio.TimeoutError:
+            log.warning("knowledge prefetch timed out for: %s", text)
+            return tuple()
+        except Exception:
+            log.exception("knowledge prefetch failed for: %s", text)
+            return tuple()
+        log.info(
+            "knowledge prefetch: %r -> %d chunks, best=%.3f, %.0f ms",
+            text, len(chunks), best, (time.perf_counter() - t0) * 1000,
+        )
+        # Prices are deliberately not in the KB (team follows up), so they aren't gaps.
+        if (
+            best < _GAP_THRESHOLD
+            and len(text.split()) >= _MIN_GAP_WORDS
+            and not _PRICING_Q.search(text)
+        ):
+            asyncio.create_task(self._log_gap(text))
+        return chunks
 
     @function_tool
     async def book_consultation(
@@ -275,6 +423,12 @@ class AppointmentTools:
             preferred_time: Preferred consultation time, if provided.
         """
 
+        if not name or not name.strip():
+            return {
+                "status": "failed",
+                "message": "Name is required. Please ask the caller for their name before proceeding.",
+            }
+
         if self.call_id:
             await asyncio.to_thread(
                 update_call_lead,
@@ -283,7 +437,7 @@ class AppointmentTools:
                 phone=phone,
                 email=email,
                 company=company,
-                requirement=f"{requirement} (Preferred: {preferred_date} {preferred_time})",
+                requirement=_with_preferred_slot(requirement, preferred_date, preferred_time),
             )
 
         log.info("book_consultation -> %s", name)
@@ -303,58 +457,81 @@ class AppointmentTools:
     ) -> dict:
         """Transfer the caller to a Zryth team member.
 
-        Use when the caller specifically asks to speak with a human,
-        asks for a team member, or the request requires human assistance.
+        Use when the caller asks to be transferred, to speak with a human or
+        someone from the team, or the request requires human assistance.
+        In the same reply, briefly tell the caller you're connecting them now
+        and to please hold.
         """
 
-        log.info(
-            "transfer_to_human -> %s",
-            DEFAULT_TRANSFER_NUMBER,
-        )
+        sip_trunk_id = os.getenv("LIVEKIT_SIP_OUTBOUND_TRUNK")
+        sip_number = os.getenv("LIVEKIT_SIP_NUMBER")
 
-        return {
-            "action": "transfer",
-            "to": DEFAULT_TRANSFER_NUMBER,
-        }
+        if not sip_trunk_id:
+            log.error(
+                "transfer_to_human: LIVEKIT_SIP_OUTBOUND_TRUNK not set — SIP warm transfer unavailable."
+            )
+            return (
+                "I'm sorry, the transfer service is not configured yet. "
+                "The Zryth team will call you back directly."
+            )
+
+        # Blocks the silence check / hang-up logic while the caller is on hold.
+        self.is_transferring = True
+        try:
+            # Let the "connecting you now" line (spoken with this tool call) finish
+            # before dialling, so the caller isn't left in silence.
+            await context.wait_for_playout()
+
+            result = await WarmTransferTask(
+                sip_call_to=DEFAULT_TRANSFER_NUMBER,
+                sip_trunk_id=sip_trunk_id,
+                sip_number=sip_number,
+                chat_ctx=context.session.history,
+                ringing_timeout=30.0,
+            )
+
+            log.info("transfer_to_human -> success, agent: %s", result.human_agent_identity)
+            # The team member is now in the caller's room; Maya must leave so she
+            # doesn't talk over them. The room (and the call) stays up.
+            if self.job_ctx is not None:
+                self.job_ctx.shutdown(reason="transferred to human")
+            return "Transfer completed. Stay silent; the team member is now on the line."
+
+        except Exception:
+            self.is_transferring = False
+            log.exception(
+                "Human transfer failed (trunk=%s, to=%s)",
+                sip_trunk_id,
+                DEFAULT_TRANSFER_NUMBER,
+            )
+            return (
+                "I was unable to connect you to a team member right now. "
+                "Please try again in a moment."
+            )
+
 
     @function_tool
     async def end_call(
         self,
         context: RunContext,
-    ) -> dict:
+    ) -> str:
         """Initiates the call termination sequence. Use when the conversation is finished."""
 
         log.info("end_call requested by Maya")
 
         if self.job_ctx is None:
             log.warning("Cannot end call: JobContext is not available")
-            return {
-                "status": "failed",
-                "message": "Call ending is not available.",
-            }
+            return ""
             
         if hasattr(context.session, "_closed") and context.session._closed:
-            return {"status": "ended", "message": "Already ending."}
+            return ""
 
-        # Cancel any pending duplicate shutdown
-        if self._shutdown_task and not self._shutdown_task.done():
-            self._shutdown_task.cancel()
+        if not self.is_ending:
+            self.is_ending = True
+            if self.on_end_requested:
+                self.on_end_requested()
+        return "Call will end after your goodbye. Say a brief, polite goodbye now."
 
-        async def _delayed_shutdown():
-            # Give the LLM's goodbye audio time to finish before shutting down.
-            await asyncio.sleep(6)
-            if self.job_ctx:
-                try:
-                    self.job_ctx.shutdown(reason="customer ended conversation")
-                except Exception as exc:
-                    log.warning("shutdown() raised: %s", exc)
-
-        self._shutdown_task = asyncio.create_task(_delayed_shutdown())
-
-        return {
-            "status": "ending",
-            "message": "Call ending sequence initiated. Please say a brief, polite goodbye to the user.",
-        }
 
 if __name__ == "__main__":
     DATA_DIR.mkdir(exist_ok=True)
