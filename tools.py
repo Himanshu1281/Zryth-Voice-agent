@@ -287,7 +287,7 @@ def build_dynamic_tools(tool_specs: list[dict]) -> list:
 
 
 def _clean_phone(phone: str | None) -> str | None:
-    """Return a valid 10-digit Indian mobile number, or None.
+    """Return a valid ten-digit Indian mobile number, or None.
 
     Accepts spaces, dashes, brackets and a +91 / 91 / 0 prefix
     ("+91 98765-43210" -> "9876543210"). Must start with 6-9.
@@ -301,9 +301,35 @@ def _clean_phone(phone: str | None) -> str | None:
 
 
 _BAD_PHONE_MSG = (
-    "That phone number is not a valid 10-digit mobile number. Read back what you heard "
-    "and ask the caller to repeat their 10-digit number. Do not save until it is valid."
+    "That phone number is not a valid ten-digit mobile number. Read back what you heard "
+    "and ask the caller to repeat their ten-digit number. Do not save until it is valid."
 )
+
+# Values the LLM invents when it calls a tool before the caller has said anything.
+_PLACEHOLDERS = {"", "user", "caller", "customer", "unknown", "none", "null", "n/a", "na", "name", "phone"}
+
+
+def _missing_details(name: str | None, phone: str | None) -> dict | None:
+    """Failure result when name/phone were never actually given, else None.
+
+    Keeps Maya from telling the caller their number is invalid when they
+    haven't given one yet (the LLM fills placeholders like "User").
+    """
+    missing = []
+    if (name or "").strip().lower() in _PLACEHOLDERS:
+        missing.append("name")
+    if not re.search(r"\d", phone or ""):
+        missing.append("phone number")
+    if not missing:
+        return None
+    return {
+        "status": "failed",
+        "message": (
+            f"Nothing was saved: the caller has not given their {' or '.join(missing)} yet. "
+            "Do NOT say anything was invalid or that they provided it. Politely ask for the "
+            f"{missing[0]} now (one question only), then call this tool again."
+        ),
+    }
 
 
 class AppointmentTools:
@@ -354,21 +380,19 @@ class AppointmentTools:
 
         Use when the caller shows interest but has NOT asked to book a meeting
         (for a date/time or "book a call", use `book_consultation`).
-        Ask the caller ONLY for their name and 10-digit phone number. Never ask
+        Ask the caller ONLY for their name and ten-digit phone number. Never ask
         for email, company, or anything else.
 
         Args:
             name: Caller's name.
-            phone: Caller's 10-digit mobile number.
+            phone: Caller's ten-digit mobile number.
             requirement: What they want, summarised by you from the conversation
                 (do NOT ask the caller for this).
         """
 
-        if not name or not name.strip():
-            return {
-                "status": "failed",
-                "message": "Name is required. Please ask the caller for their name before proceeding.",
-            }
+        missing = _missing_details(name, phone)
+        if missing:
+            return missing
         clean = _clean_phone(phone)
         if not clean:
             return {"status": "failed", "message": _BAD_PHONE_MSG}
@@ -443,23 +467,21 @@ class AppointmentTools:
 
         Use ONLY when the caller asks to schedule or book a meeting/call, or agrees
         when you offer one; otherwise use `capture_lead`.
-        Ask the caller ONLY for their name, 10-digit phone number and (optionally)
+        Ask the caller ONLY for their name, ten-digit phone number and (optionally)
         a preferred date/time. Never ask for email, company, or anything else.
 
         Args:
             name: Caller's name.
-            phone: Caller's 10-digit mobile number.
+            phone: Caller's ten-digit mobile number.
             requirement: What they want, summarised by you from the conversation
                 (do NOT ask the caller for this).
             preferred_date: Preferred date, if the caller gave one.
             preferred_time: Preferred time, if the caller gave one.
         """
 
-        if not name or not name.strip():
-            return {
-                "status": "failed",
-                "message": "Name is required. Please ask the caller for their name before proceeding.",
-            }
+        missing = _missing_details(name, phone)
+        if missing:
+            return missing
         clean = _clean_phone(phone)
         if not clean:
             return {"status": "failed", "message": _BAD_PHONE_MSG}
