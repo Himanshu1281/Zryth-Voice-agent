@@ -11,6 +11,7 @@ import asyncio
 import logging
 import lancedb
 import threading
+import time
 
 log = logging.getLogger(__name__)
 
@@ -20,6 +21,26 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 LANCEDB_PATH = os.path.join(BASE_DIR, "data", "lancedb")
 
 _lancedb_sync_lock = threading.Lock()
+
+# PostgREST returns at most 1000 rows per request (Supabase default): page through.
+PAGE_SIZE = 1000
+# Safety net when Realtime events are missed: full resync at least this often.
+KB_RESYNC_INTERVAL_S = int(os.getenv("KB_RESYNC_INTERVAL_S", "600"))
+
+
+def fetch_all(table: str, columns: str, apply=None) -> list[dict]:
+    """Every row of a query, paged so results are never silently capped at 1000."""
+    rows: list[dict] = []
+    start = 0
+    while True:
+        q = _init_supabase().table(table).select(columns)
+        if apply is not None:
+            q = apply(q)
+        batch = q.order("id").range(start, start + PAGE_SIZE - 1).execute().data or []
+        rows.extend(batch)
+        if len(batch) < PAGE_SIZE:
+            return rows
+        start += PAGE_SIZE
 
 # Re-chunk knowledge written by other chunkers. Enable on ONE host only.
 KB_AUTO_HEAL = os.getenv("KB_AUTO_HEAL", "false").strip().lower() in ("1", "true", "yes")
@@ -70,14 +91,20 @@ def create_call(
     livekit_room: str,
     phone: Optional[str] = None,
     language: str = "en",
+    org_id: Optional[str] = None,
+    org_agent_id: Optional[str] = None,
+    dialed_number: Optional[str] = None,
 ) -> str:
-    """Create a call record and return its Supabase UUID."""
+    """Create a call record (tagged with the answering org/agent) and return its UUID."""
 
     data = {
         "livekit_room": livekit_room,
         "phone": phone,
         "language": language,
         "started_at": datetime.now(IST).isoformat(),
+        "org_id": org_id,
+        "agent_id": org_agent_id,  # calls.agent_id -> agents.id
+        "dialed_number": dialed_number,
     }
 
     response = (
@@ -179,8 +206,34 @@ def save_call_summary(
     ).eq("id", call_id).execute()
 
 
+# Template prompts/tools are read at every call start, before the greeting: cache them
+# briefly so a call costs no Supabase round trips (dashboard edits apply within the TTL).
+_TEMPLATE_CACHE_TTL_S = 30.0
+_template_cache: dict[tuple, tuple[float, object]] = {}
+_template_cache_lock = threading.Lock()
+
+
+def _cached(key: tuple, load):
+    now = time.monotonic()
+    with _template_cache_lock:
+        hit = _template_cache.get(key)
+        if hit and now - hit[0] < _TEMPLATE_CACHE_TTL_S:
+            return hit[1]
+    value = load()
+    if value is not None:
+        with _template_cache_lock:
+            _template_cache[key] = (now, value)
+    return value
+
+
 def fetch_dynamic_prompt(tag: str, fallback_content: str, agent_id: str = "maya_v2") -> str:
     """Fetch a custom prompt from Supabase if it's explicitly assigned to the agent."""
+    content = _cached(("prompt", agent_id, tag), lambda: _load_prompt(tag, agent_id))
+    return content or fallback_content
+
+
+def _load_prompt(tag: str, agent_id: str) -> str | None:
+    """Assigned prompt's content, '' when not assigned, None on error (not cached)."""
     try:
         sb = _init_supabase()
         
@@ -188,20 +241,22 @@ def fetch_dynamic_prompt(tag: str, fallback_content: str, agent_id: str = "maya_
         assignment = sb.table("agent_prompts").select("*").eq("agent_id", agent_id).eq("prompt_tag", tag).execute()
         
         # If it's not explicitly assigned, immediately return the default hardcoded greeting
-        if not assignment.data or len(assignment.data) == 0:
-            return fallback_content 
+        if not assignment.data:
+            return ""
         # 2. If it IS assigned, fetch the custom content from the prompts table
         response = sb.table("prompts").select("content").eq("tag", tag).execute()
-        
-        if response.data and len(response.data) > 0:
-            return response.data[0]["content"]
+        return response.data[0]["content"] if response.data else ""
     except Exception as e:
         log.error(f"Failed to fetch prompt '{tag}': {e}")
-        
-    return fallback_content
+        return None
+
 
 def fetch_assigned_tools(agent_id: str = "maya_v2") -> list[dict]:
     """Fetch JSON specs for tools explicitly assigned to the agent."""
+    return _cached(("tools", agent_id), lambda: _load_tools(agent_id)) or []
+
+
+def _load_tools(agent_id: str) -> list[dict] | None:
     try:
         sb = _init_supabase()
         
@@ -218,7 +273,7 @@ def fetch_assigned_tools(agent_id: str = "maya_v2") -> list[dict]:
         
     except Exception as e:
         log.error(f"Failed to fetch assigned tools for '{agent_id}': {e}")
-        return []
+        return None
 
 def sync_knowledge_to_lancedb() -> None:
     """Sync Supabase knowledge base to local LanceDB."""
@@ -228,17 +283,16 @@ def sync_knowledge_to_lancedb() -> None:
         return
 
     try:
-        response = (
-            _init_supabase()
-            .table("zryth_knowledge")
-            .select("id, content, embedding")
-            .execute()
-        )
-
-        data = response.data
+        data = fetch_all("zryth_knowledge", "id, content, embedding, agent_id")
 
         if not data:
-            log.info("No data in Supabase zryth_knowledge to sync.")
+            # Knowledge base is empty (e.g. last document deleted): drop the local
+            # table too, otherwise Maya keeps answering from stale chunks.
+            log.info("No data in Supabase zryth_knowledge; clearing local LanceDB.")
+            if os.path.exists(LANCEDB_PATH):
+                local = lancedb.connect(LANCEDB_PATH)
+                if "knowledge" in local.table_names():
+                    local.drop_table("knowledge")
             return
 
         lancedb_data = []
@@ -252,6 +306,8 @@ def sync_knowledge_to_lancedb() -> None:
                         "id": row["id"],
                         "content": row["content"],
                         "vector": vec,
+                        # '' = rows without an agent; searches filter on this per call
+                        "agent_id": row.get("agent_id") or "",
                     }
                 )
 
@@ -296,77 +352,60 @@ def sync_knowledge_to_lancedb() -> None:
 
 
 async def realtime_sync_loop() -> None:
-    """Listen for Supabase Realtime changes and sync local LanceDB."""
+    """Keep the local LanceDB in sync with zryth_knowledge.
 
-    sync_queue = asyncio.Queue()
+    Realtime events trigger a (debounced) resync; if the subscription drops or never
+    connects it is retried with backoff, and a full resync runs every
+    KB_RESYNC_INTERVAL_S regardless, so a missed event can't leave a host stale.
+    """
+    sync_queue: asyncio.Queue = asyncio.Queue()
     loop = asyncio.get_running_loop()
 
     def _realtime_callback(payload):
-        """Queue a sync whenever zryth_knowledge changes."""
         try:
-            loop.call_soon_threadsafe(
-                sync_queue.put_nowait,
-                True,
-            )
-            log.info(
-                "Supabase Realtime event received: %s",
-                payload.get("eventType", "unknown"),
-            )
+            loop.call_soon_threadsafe(sync_queue.put_nowait, True)
+            log.info("Supabase Realtime event received: %s", payload.get("eventType", "unknown"))
         except Exception as e:
-            log.warning(
-                f"Could not queue Realtime sync event: {e}"
-            )
+            log.warning(f"Could not queue Realtime sync event: {e}")
 
-    try:
-        supabase_client = await _init_realtime_supabase()
+    async def _subscribe_forever() -> None:
+        backoff = 5
+        while True:
+            try:
+                client = await _init_realtime_supabase()
+                channel = client.channel("zryth_knowledge_changes")
+                channel.on_postgres_changes(
+                    event="*", schema="public", table="zryth_knowledge", callback=_realtime_callback,
+                )
+                await channel.subscribe()
+                log.info("Subscribed to Supabase Realtime for public.zryth_knowledge.")
+                # Catch up on anything that changed while we were disconnected
+                sync_queue.put_nowait(True)
+                return
+            except Exception:
+                log.exception("Realtime subscribe failed; retrying in %ss", backoff)
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 300)
 
-        channel = supabase_client.channel(
-            "zryth_knowledge_changes"
-        )
+    async def _periodic() -> None:
+        while True:
+            await asyncio.sleep(KB_RESYNC_INTERVAL_S)
+            sync_queue.put_nowait(True)
 
-        # Using on_postgres_changes as required by the python AsyncRealtimeChannel
-        channel.on_postgres_changes(
-            event="*",
-            schema="public",
-            table="zryth_knowledge",
-            callback=_realtime_callback,
-        )
-
-        await channel.subscribe()
-
-        log.info(
-            "Successfully subscribed to Supabase Realtime "
-            "for public.zryth_knowledge."
-        )
-
-    except Exception as e:
-        log.exception(
-            f"Failed to subscribe to Supabase Realtime: {e}"
-        )
-        return
+    asyncio.create_task(_subscribe_forever())
+    asyncio.create_task(_periodic())
 
     while True:
-        # Wait for the first database change.
         await sync_queue.get()
-
-        # Debounce multiple rapid changes.
-        await asyncio.sleep(5)
-
-        # Drain additional events.
+        await asyncio.sleep(5)  # debounce bursts (e.g. a 200-chunk ingest)
         while not sync_queue.empty():
             try:
                 sync_queue.get_nowait()
             except asyncio.QueueEmpty:
                 break
 
-        log.info(
-            "Supabase Realtime change detected. "
-            "Synchronizing LanceDB..."
-        )
-
-        # Rows written by another chunker (e.g. the dashboard upload) get rebuilt
-        # sentence-aware. Opt-in (KB_AUTO_HEAL=true) on exactly ONE host: if several
-        # agent hosts healed concurrently they would insert duplicate chunks.
+        # Rows written by another chunker get rebuilt sentence-aware. Opt-in
+        # (KB_AUTO_HEAL=true) on exactly ONE host, or hosts would insert duplicates.
         if KB_AUTO_HEAL:
             try:
                 from knowledge_ingest import heal_legacy_chunks
@@ -378,19 +417,10 @@ async def realtime_sync_loop() -> None:
                 log.exception("Legacy chunk healing failed; syncing rows as they are")
 
         try:
-            await asyncio.to_thread(
-                sync_knowledge_to_lancedb
-            )
+            await asyncio.to_thread(sync_knowledge_to_lancedb)
+        except Exception:
+            log.exception("Error syncing LanceDB")
 
-            log.info(
-                "LanceDB synchronization completed "
-                "after Realtime event."
-            )
-
-        except Exception as e:
-            log.exception(
-                f"Error syncing LanceDB after Realtime event: {e}"
-            )
 
 if __name__ == "__main__":
     print("Testing Supabase connection...")

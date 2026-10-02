@@ -19,14 +19,16 @@ app = FastAPI(
 WEBHOOK_SECRET = os.getenv("SUPABASE_WEBHOOK_SECRET")
 
 
-from fastapi.middleware.cors import CORSMiddleware
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# No CORS: only zryth-backend calls this server (server-to-server), never a browser.
+
+
+def _verify(secret: str | None) -> None:
+    """Every /internal route requires the shared secret zryth-backend sends."""
+    if not WEBHOOK_SECRET:
+        log.error("SUPABASE_WEBHOOK_SECRET is not configured")
+        raise HTTPException(status_code=500, detail="Webhook secret is not configured")
+    if not secret or not hmac.compare_digest(secret, WEBHOOK_SECRET):
+        raise HTTPException(status_code=401, detail="Invalid webhook secret")
 
 
 @app.get("/health")
@@ -41,28 +43,7 @@ async def health():
 async def knowledge_sync(
     x_webhook_secret: str | None = Header(default=None),
 ):
-    if not WEBHOOK_SECRET:
-        log.error("SUPABASE_WEBHOOK_SECRET is not configured")
-        raise HTTPException(
-            status_code=500,
-            detail="Webhook secret is not configured",
-        )
-
-    if not x_webhook_secret:
-        raise HTTPException(
-            status_code=401,
-            detail="Missing webhook secret",
-        )
-
-    if not hmac.compare_digest(
-        x_webhook_secret,
-        WEBHOOK_SECRET,
-    ):
-        log.warning("Invalid webhook secret received")
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid webhook secret",
-        )
+    _verify(x_webhook_secret)
 
     log.info(
         "Supabase knowledge webhook received. "
@@ -103,7 +84,8 @@ async def knowledge_sync(
         )
 
 class IngestRequest(BaseModel):
-    filename: str  # object name in the knowledge_base bucket (.pdf or .txt)
+    filename: str                # object path in the knowledge_base bucket (.pdf or .txt)
+    agent_id: str | None = None  # org agent that owns it; None = no agent
 
 
 @app.post("/internal/knowledge/ingest")
@@ -116,30 +98,71 @@ async def knowledge_ingest(
     The dashboard should call this after uploading to the bucket instead of
     chunking itself. Replaces that file's existing rows.
     """
-    if not WEBHOOK_SECRET or not x_webhook_secret or not hmac.compare_digest(
-        x_webhook_secret, WEBHOOK_SECRET
-    ):
-        raise HTTPException(status_code=401, detail="Invalid webhook secret")
+    _verify(x_webhook_secret)
 
     from knowledge_ingest import ingest_source
     from starlette.concurrency import run_in_threadpool
 
     try:
-        count = await run_in_threadpool(ingest_source, req.filename)
+        count = await run_in_threadpool(ingest_source, req.filename, req.agent_id)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception:
         log.exception("Ingest failed for %s", req.filename)
         raise HTTPException(status_code=500, detail="Ingest failed")
 
+    # Refresh this host's LanceDB now instead of waiting for the realtime event.
+    await run_in_threadpool(sync_knowledge_to_lancedb)
     return {"status": "ok", "filename": req.filename, "chunks": count}
+
+
+class DeleteRequest(BaseModel):
+    filename: str  # object name that was removed from the knowledge_base bucket
+
+
+@app.post("/internal/knowledge/delete")
+async def knowledge_delete(
+    req: DeleteRequest,
+    x_webhook_secret: str | None = Header(default=None),
+):
+    """Drop a deleted file's chunks so Maya stops answering from it."""
+    _verify(x_webhook_secret)
+
+    from knowledge_ingest import delete_source
+    from starlette.concurrency import run_in_threadpool
+
+    try:
+        removed = await run_in_threadpool(delete_source, req.filename)
+        await run_in_threadpool(sync_knowledge_to_lancedb)
+    except Exception:
+        log.exception("Delete failed for %s", req.filename)
+        raise HTTPException(status_code=500, detail="Delete failed")
+
+    return {"status": "ok", "filename": req.filename, "removed": removed}
 
 
 class SummarizeRequest(BaseModel):
     transcript: str
 
+SUMMARY_PROMPT = """You are an expert conversation analyst. Read the following customer service transcript and write a concise, professional summary paragraph (3-5 sentences).
+
+Make sure to include:
+1. The customer's specific questions or requests.
+2. Any exact product names, features, or details the agent provided.
+3. The final outcome of the call.
+
+Write it as a fluid paragraph, without bullet points or markdown.
+
+Transcript:
+"""
+
+
 @app.post("/internal/ai/summarize")
-async def summarize_call(req: SummarizeRequest):
+async def summarize_call(
+    req: SummarizeRequest,
+    x_webhook_secret: str | None = Header(default=None),
+):
+    _verify(x_webhook_secret)
     api_key = os.getenv("GOOGLE_API_KEY")
     if not api_key:
         raise HTTPException(status_code=500, detail="Missing GOOGLE_API_KEY in backend environment")
@@ -154,7 +177,7 @@ async def summarize_call(req: SummarizeRequest):
     req_obj = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
     
     try:
-        with urllib.request.urlopen(req_obj) as response:
+        with urllib.request.urlopen(req_obj, timeout=60) as response:
             res_body = json.loads(response.read().decode("utf-8"))
             candidates = res_body.get("candidates", [])
             if not candidates:

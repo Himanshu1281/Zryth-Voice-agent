@@ -21,6 +21,7 @@ import logging
 import os
 import re
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 # --- TLS / cert guard (optional) --------------------------------------------
@@ -61,10 +62,9 @@ from livekit.agents import (
 )
 from livekit.agents import NOT_GIVEN
 from livekit.agents.llm import FallbackAdapter
-from livekit.plugins import google, openai, sarvam, silero
+from livekit.plugins import openai, sarvam, silero
 
 from config import (
-    AGENT_NAME,
     AUDIO_SAMPLE_RATE,
     BCP47,
     DEFAULT_LANGUAGE,
@@ -83,16 +83,15 @@ from config import (
     SUPPORTED_LANGUAGES,
     VAD_MIN_SILENCE_S,
     VAD_ACTIVATION_THRESHOLD,
-    VAD_MIN_SPEECH_DURATION,
     USER_AWAY_TIMEOUT_S,
 )
 from prompts import (
-    GREETINGS,
-    HOT_PERSONA,
     LANG_NAMES,
     STYLE_NOTES,
     build_instructions,
+    greeting,
 )
+from routing import CallConfig, resolve_call_config
 from tools import AppointmentTools, build_dynamic_tools, summarize_transcript
 
 from database import (
@@ -100,8 +99,7 @@ from database import (
     save_message,
     finish_call,
     save_call_summary,
-    set_call_phone,
-    sync_knowledge_to_lancedb, 
+    sync_knowledge_to_lancedb,
     fetch_dynamic_prompt,
     fetch_assigned_tools,
 )
@@ -113,18 +111,20 @@ log = logging.getLogger("voice-agent")
 # (dashboard/build_dashboard.py) reads this to colour-code each call.
 METRICS_LOG = Path(__file__).parent / "logs" / "metrics.jsonl"
 
-# Confirmation phrase spoken the moment we switch language, IN that language.
-# These MUST exist for every supported language -- see set_language for why.
 # Spoken when the LLM returns nothing, so the caller never hears dead air.
 EMPTY_REPLY_FALLBACK: dict[str, str] = {
     "en": "Sorry, could you say that once more?",
     "hi": "माफ़ कीजिए, क्या आप एक बार फिर से बता सकते हैं?",
 }
 
-CONFIRMATIONS: dict[str, str] = {
-    "en": "Perfect, we'll continue in English.",
-    "hi": "ठीक है, अब हम हिंदी में बात करेंगे।",
+# Spoken only when the knowledge lookup is slow, so the caller never hears dead air.
+# Not added to the chat history, so the LLM doesn't repeat or react to it.
+FILLERS: dict[str, tuple[str, ...]] = {
+    "en": ("Let me check.", "One moment.", "Sure, let me see."),
+    "hi": ("एक सेकंड, देखती हूँ।", "जी, बस एक पल।", "ठीक है, देखती हूँ।"),
 }
+FILLER_DELAY_S = 0.6  # lookups faster than this get no filler
+
 
 # --- pipeline wiring ---------------------------------------------------------
 def _build_llm():
@@ -150,7 +150,7 @@ def _build_llm():
         max_retries=0,
     )
     # Groq normally starts in ~0.3 s; if it hasn't within 1.5 s, use Gemini.
-    return FallbackAdapter([groq, gemini], attempt_timeout=3.0, max_retry_per_llm=0)
+    return FallbackAdapter([groq, gemini], attempt_timeout=1.5, max_retry_per_llm=0)
 
 
 def _build_session(
@@ -158,13 +158,14 @@ def _build_session(
     job_ctx: JobContext,
     call_id: str,
     dynamic_tool_specs: list[dict],
+    config: CallConfig,
 ) -> tuple["AgentSession", "AppointmentTools"]:
 
     """Wire the whole cascade for a starting language. Returns (session, tools_instance).
     The tools instance is returned separately so the caller can reset per-turn counters.
     """
     bcp47 = BCP47[language]
-    tools_instance = AppointmentTools(job_ctx, call_id)
+    tools_instance = AppointmentTools(job_ctx, call_id, config)
     
     tools_list = tools_instance.to_tools()
     tools_list.extend(build_dynamic_tools(dynamic_tool_specs))
@@ -222,9 +223,10 @@ def _with_caller(instructions: str, caller_phone: str | None) -> str:
 def _compose_instructions(code: str, caller_phone: str | None, kb: "AppointmentTools | None") -> str:
     """Persona + language rules, then the whole KB (small-KB fast path), then the
     per-call caller line last so the long stable prefix stays cacheable."""
-    text = build_instructions(code, STYLE_NOTES[code])
+    cfg = kb.config if kb is not None else CallConfig()
+    text = build_instructions(code, STYLE_NOTES[code], business=cfg.business_name, persona=cfg.persona_name)
     if kb is not None and kb.full_kb:
-        text += "\n\nRelevant Zryth knowledge (the ONLY source of facts):\n" + kb.full_kb
+        text += f"\n\nRelevant {cfg.business_name} knowledge (the ONLY source of facts):\n" + kb.full_kb
     return _with_caller(text, caller_phone)
 
 
@@ -291,7 +293,7 @@ class BaseMayaAgent(Agent):
     async def on_user_turn_completed(
         self, turn_ctx: agents.llm.ChatContext, new_message: agents.llm.ChatMessage
     ) -> None:
-        """Inject relevant Zryth knowledge so the LLM answers in ONE round trip."""
+        """Inject the agent's relevant knowledge so the LLM answers in ONE round trip."""
         text = new_message.text_content or ""
         # Drop near-silent noise ("Hmm", "Oh bro" at ~0.05 confidence) instead of answering it.
         conf = getattr(new_message, "transcript_confidence", None)
@@ -319,17 +321,31 @@ class BaseMayaAgent(Agent):
             ]
             if prev:
                 text = f"{prev[-1]} {text}"
-        chunks = await self.kb.retrieve_for_turn(text)
+        filler = asyncio.create_task(self._filler_after(FILLER_DELAY_S))
+        try:
+            chunks = await self.kb.retrieve_for_turn(text)
+        finally:
+            filler.cancel()
         if chunks:
             # Must be "system": as "assistant", Gemini continues the message and reads
             # the raw chunks aloud ("[Zryth Company Profile] Zryth's AI products are...").
             turn_ctx.add_message(
                 role="system",
                 content=(
-                    "Relevant Zryth knowledge (reference only; never read it out verbatim, "
+                    f"Relevant {self.kb.config.business_name} knowledge (reference only; never read it out verbatim, "
                     "answer the caller in your own short words):\n" + "\n\n".join(chunks)
                 ),
             )
+
+    async def _filler_after(self, delay: float) -> None:
+        """Say a short "let me check" if the knowledge lookup is still running after `delay`."""
+        await asyncio.sleep(delay)
+        options = FILLERS.get(self.code, FILLERS["en"])
+        self._filler_i = (getattr(self, "_filler_i", -1) + 1) % len(options)
+        try:
+            self.session.say(options[self._filler_i], add_to_chat_ctx=False)
+        except Exception:
+            log.exception("filler failed")
 
     async def _switch_language(self, code: str) -> None:
         """Reply language + TTS voice follow the caller; STT keeps auto-detecting."""
@@ -359,15 +375,17 @@ class GreeterAgent(BaseMayaAgent):
     """Greets the caller in English and detects their language."""
 
     def __init__(
-        self, caller_phone: str | None = None, kb: AppointmentTools | None = None
+        self, caller_phone: str | None = None, kb: AppointmentTools | None = None,
+        language: str = "en",
     ) -> None:
         # Full per-language prompt (incl. call-ending + tool-result rules) --
-        # most English calls never leave the greeter.
+        # most calls never leave the greeter.
         super().__init__(
-            instructions=_compose_instructions("en", caller_phone, kb)
+            instructions=_compose_instructions(language, caller_phone, kb)
         )
         self.caller_phone = caller_phone
         self.kb = kb
+        self.code = language
 
 
 # --- metrics -> JSONL --------------------------------------------------------
@@ -414,14 +432,34 @@ def prewarm(proc) -> None:
 
 
 async def entrypoint(ctx: JobContext) -> None:
-    # Try to extract phone from room name or metadata
-    phone = None
-    if ctx.room.metadata and "+" in ctx.room.metadata:
-        phone = ctx.room.metadata
-    elif "+" in ctx.room.name:
-        phone = ctx.room.name
-        
     start_time = time.time()
+
+    # Who is calling, and which of our numbers did they dial? The dialled number
+    # decides which organization's agent answers (routing.resolve_call_config).
+    await ctx.connect()
+    phone = dialed = None
+    try:
+        participant = await asyncio.wait_for(ctx.wait_for_participant(), timeout=3.0)
+        phone = participant.attributes.get("sip.phoneNumber") or None
+        dialed = participant.attributes.get("sip.trunkPhoneNumber") or None
+    except Exception:
+        log.warning("Could not read SIP participant attributes; continuing without them")
+    if not phone:
+        # Fallback: some dispatch setups put the caller number in the room name/metadata
+        if ctx.room.metadata and "+" in ctx.room.metadata:
+            phone = ctx.room.metadata
+        elif "+" in ctx.room.name:
+            phone = ctx.room.name
+
+    config = await asyncio.to_thread(resolve_call_config, dialed)
+    if config.blocked:
+        # One of our numbers, but the customer hasn't connected it to an agent yet
+        log.warning("Number %s is not connected to an agent; dropping call", config.dialed_number)
+        try:
+            await ctx.api.room.delete_room(lk_api.DeleteRoomRequest(room=ctx.room.name))
+        finally:
+            ctx.shutdown(reason="number not configured")
+        return
 
     # Create one Supabase record for this call.
     # Fall back to a local UUID if Supabase is unavailable so the call continues.
@@ -430,7 +468,10 @@ async def entrypoint(ctx: JobContext) -> None:
             create_call,
             livekit_room=ctx.room.name,
             phone=phone,
-            language=DEFAULT_LANGUAGE,
+            language=config.language,
+            org_id=config.org_id,
+            org_agent_id=config.org_agent_id,
+            dialed_number=config.dialed_number,
         )
     except Exception:
         import uuid
@@ -438,21 +479,24 @@ async def entrypoint(ctx: JobContext) -> None:
         log.exception("Supabase create_call failed; using in-memory call_id=%s", call_id)
 
     log.info(
-        "Supabase call created: %s for room %s",
-        call_id,
-        ctx.room.name,
+        "Supabase call created: %s for room %s (org=%s agent=%s)",
+        call_id, ctx.room.name, config.org_id, config.org_agent_id,
     )
-    
+
+    default_greeting = config.greeting or greeting(config.language, config.business_name, config.persona_name)
     dynamic_greeting, dynamic_tool_specs = await asyncio.gather(
-        asyncio.to_thread(fetch_dynamic_prompt, "greeting_prompt", GREETINGS[DEFAULT_LANGUAGE]),
-        asyncio.to_thread(fetch_assigned_tools, "maya_v2"),
+        # A template-level greeting_prompt applies only when the customer set no greeting
+        asyncio.to_thread(fetch_dynamic_prompt, "greeting_prompt", default_greeting, config.template_id)
+        if not config.greeting else asyncio.sleep(0, result=config.greeting),
+        asyncio.to_thread(fetch_assigned_tools, config.template_id),
     )
 
     session, tools_instance = _build_session(
-        DEFAULT_LANGUAGE,
+        config.language,
         ctx,
         call_id,
         dynamic_tool_specs,
+        config,
     )
     await tools_instance.prepare_kb()
     session.on(
@@ -599,20 +643,8 @@ async def entrypoint(ctx: JobContext) -> None:
     session.on("agent_state_changed", on_agent_state_changed)
     tools_instance.on_end_requested = lambda: asyncio.create_task(_hang_up_fallback())
 
-    await ctx.connect()
-
-    # Real caller ID from the SIP participant (falls back to the room-name guess).
-    try:
-        participant = await asyncio.wait_for(ctx.wait_for_participant(), timeout=3.0)
-        sip_phone = participant.attributes.get("sip.phoneNumber")
-        if sip_phone:
-            phone = sip_phone
-            asyncio.create_task(asyncio.to_thread(set_call_phone, call_id, sip_phone))
-    except Exception:
-        log.warning("Could not read SIP caller number; continuing without it")
-
     await session.start(
-        agent=GreeterAgent(caller_phone=phone, kb=tools_instance),
+        agent=GreeterAgent(caller_phone=phone, kb=tools_instance, language=config.language),
         room=ctx.room,
     )
 
@@ -622,48 +654,58 @@ async def entrypoint(ctx: JobContext) -> None:
 
 if __name__ == "__main__":
 
-    log.info("Performing initial LanceDB sync...")
-    sync_knowledge_to_lancedb()
+    import sys
 
-    from database import _init_supabase
+    # Only commands that run the worker need the KB sync, heartbeat and status rows;
+    # "download-files" (Docker build) and "--help" must work without Supabase.
+    runs_worker = len(sys.argv) > 1 and sys.argv[1] in ("dev", "start", "console", "connect")
+    if runs_worker:
+        log.info("Performing initial LanceDB sync...")
+        sync_knowledge_to_lancedb()
 
-    try:
-        supabase = _init_supabase()
-        supabase.table("agent_status").upsert({
-            "agent_id": "maya_v2", 
-            "status": "active",
-            "last_heartbeat": "now()"
-        }).execute()
-        log.info("Agent status set to active in Supabase.")
-    except Exception as e:
-        log.error(f"Failed to set agent status to active: {e}")
+        from database import _init_supabase
+        import socket
+
+        # One status row per worker host, so several hosts don't overwrite each
+        # other (the backend counts the platform online if any row is fresh).
+        WORKER_ID = f"{os.getenv('AGENT_NAME', 'maya')}@{socket.gethostname()}"
+
+        try:
+            supabase = _init_supabase()
+            supabase.table("agent_status").upsert({
+                "agent_id": WORKER_ID,
+                "status": "active",
+                "last_heartbeat": datetime.now(timezone.utc).isoformat()
+            }).execute()
+            log.info("Agent status set to active in Supabase.")
+        except Exception as e:
+            log.error(f"Failed to set agent status to active: {e}")
 
 
-    import threading
-    import time
-    from database import realtime_sync_loop
+        import threading
+        from database import realtime_sync_loop
 
-    def heartbeat_loop():
-        while True:
-            try:
-                sb = _init_supabase()
-                sb.table("agent_status").upsert({
-                    "agent_id": "maya_v2", 
-                    "status": "active",
-                    "last_heartbeat": "now()"
-                }).execute()
-            except Exception as e:
-                log.error(f"Heartbeat failed: {e}")
-            time.sleep(10)
+        def heartbeat_loop():
+            while True:
+                try:
+                    sb = _init_supabase()
+                    sb.table("agent_status").upsert({
+                        "agent_id": WORKER_ID,
+                        "status": "active",
+                        "last_heartbeat": datetime.now(timezone.utc).isoformat()
+                    }).execute()
+                except Exception as e:
+                    log.error(f"Heartbeat failed: {e}")
+                time.sleep(10)
 
-    def realtime_sync_worker():
-        asyncio.run(realtime_sync_loop())
+        def realtime_sync_worker():
+            asyncio.run(realtime_sync_loop())
 
-    t1 = threading.Thread(target=heartbeat_loop, daemon=True)
-    t1.start()
+        t1 = threading.Thread(target=heartbeat_loop, daemon=True)
+        t1.start()
 
-    t2 = threading.Thread(target=realtime_sync_worker, daemon=True)
-    t2.start()
+        t2 = threading.Thread(target=realtime_sync_worker, daemon=True)
+        t2.start()
 
     try:
         agents.cli.run_app(
@@ -674,12 +716,13 @@ if __name__ == "__main__":
             )
         )
     finally:
-        try:
-            supabase = _init_supabase()
-            supabase.table("agent_status").upsert({
-                "agent_id": "maya_v2", 
-                "status": "inactive"
-            }).execute()
-            log.info("Agent status set to inactive in Supabase.")
-        except Exception as e:
-            log.error(f"Failed to set agent status to inactive: {e}")
+        if runs_worker:
+            try:
+                supabase = _init_supabase()
+                supabase.table("agent_status").upsert({
+                    "agent_id": WORKER_ID,
+                    "status": "inactive"
+                }).execute()
+                log.info("Agent status set to inactive in Supabase.")
+            except Exception as e:
+                log.error(f"Failed to set agent status to inactive: {e}")

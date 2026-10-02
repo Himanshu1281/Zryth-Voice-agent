@@ -21,7 +21,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent / "scripts"))
 
 from chunking import chunk_text, title_from_filename  # noqa: E402
-from database import _init_supabase  # noqa: E402
+from database import _init_supabase, fetch_all  # noqa: E402
 
 log = logging.getLogger("knowledge-ingest")
 
@@ -39,8 +39,11 @@ def _extract_text(filename: str, data: bytes) -> str:
     return data.decode("utf-8", errors="replace")
 
 
-def build_rows(filename: str) -> list[dict]:
-    """Download one source file and return chunk rows (without embeddings)."""
+def build_rows(filename: str, agent_id: str | None = None) -> list[dict]:
+    """Download one source file and return chunk rows (without embeddings).
+
+    `filename` is the object path in the bucket: "<agent_id>/<file>" for an org
+    agent's knowledge, or "<file>" for knowledge with no agent (agent_id None)."""
     if not filename.lower().endswith(SUPPORTED_EXT):
         raise ValueError(f"Unsupported file type: {filename}")
     data = _init_supabase().storage.from_(BUCKET).download(filename)
@@ -48,49 +51,84 @@ def build_rows(filename: str) -> list[dict]:
     if "[FILL IN" in text:
         # Never let template placeholders reach callers.
         raise ValueError(f"{filename} still contains [FILL IN] placeholders")
-    chunks = chunk_text(text, title=title_from_filename(filename))
+    chunks = chunk_text(text, title=title_from_filename(filename.rsplit("/", 1)[-1]))
     return [
-        {"content": c, "metadata": {"source": filename, "chunk_index": i, "chunker": CHUNKER_VERSION}}
+        {
+            "content": c,
+            "agent_id": agent_id,
+            "metadata": {"source": filename, "chunk_index": i, "chunker": CHUNKER_VERSION},
+        }
         for i, c in enumerate(chunks)
     ]
 
 
+EMBED_BATCH = 50  # chunks per embedding request
+
+
 def _embed(rows: list[dict]) -> None:
+    """Embed in batches (one request per EMBED_BATCH chunks) with retry on rate limits.
+    A 300-chunk PDF takes a handful of requests instead of 300 sequential ones."""
     import os
 
     from google import genai
+    from google.genai import types
 
     client = genai.Client(api_key=os.getenv("GOOGLE_API_KEY"))
-    for row in rows:
-        row["embedding"] = client.models.embed_content(
-            model=EMBED_MODEL, contents=row["content"]
-        ).embeddings[0].values
-        time.sleep(0.2)  # stay under embedding rate limits
+    for i in range(0, len(rows), EMBED_BATCH):
+        batch = rows[i:i + EMBED_BATCH]
+        for attempt in range(4):
+            try:
+                # One Content per chunk: a plain list of strings is embedded as ONE combined
+                # input by gemini-embedding-2 (returns a single vector).
+                res = client.models.embed_content(
+                    model=EMBED_MODEL,
+                    contents=[types.Content(parts=[types.Part(text=r["content"])]) for r in batch],
+                )
+                break
+            except Exception:
+                if attempt == 3:
+                    raise
+                log.warning("Embedding batch %d failed (attempt %d); retrying", i // EMBED_BATCH, attempt + 1)
+                time.sleep(2 ** attempt)
+        if len(res.embeddings) != len(batch):
+            raise RuntimeError(f"Embedding count mismatch: {len(res.embeddings)} for {len(batch)} chunks")
+        for row, emb in zip(batch, res.embeddings):
+            row["embedding"] = emb.values
 
 
-def ingest_source(filename: str) -> int:
-    """(Re)ingest one source file, replacing its existing rows. Returns new row count."""
+def ingest_source(filename: str, agent_id: str | None = None) -> int:
+    """(Re)ingest one source file into one agent's KB, replacing its existing rows.
+    Returns the new row count."""
     sb = _init_supabase()
-    rows = build_rows(filename)
+    rows = build_rows(filename, agent_id)
     if not rows:
         log.warning("No text extracted from %s; leaving existing rows untouched", filename)
         return 0
     _embed(rows)
 
-    old_ids = [
-        r["id"]
-        for r in sb.table("zryth_knowledge").select("id").eq("metadata->>source", filename).execute().data
-    ]
-    sb.table("zryth_knowledge").insert(rows).execute()
-    if old_ids:
-        sb.table("zryth_knowledge").delete().in_("id", old_ids).execute()
+    old_ids = [r["id"] for r in fetch_all("zryth_knowledge", "id", lambda q: q.eq("metadata->>source", filename))]
+    for i in range(0, len(rows), 200):  # insert in chunks: big PDFs exceed request size limits
+        sb.table("zryth_knowledge").insert(rows[i:i + 200]).execute()
+    for i in range(0, len(old_ids), 500):
+        sb.table("zryth_knowledge").delete().in_("id", old_ids[i:i + 500]).execute()
     log.info("Ingested %s: %d chunks (replaced %d)", filename, len(rows), len(old_ids))
     return len(rows)
 
 
+def delete_source(filename: str) -> int:
+    """Remove every chunk of one source file. Returns the number of rows removed."""
+    sb = _init_supabase()
+    ids = [r["id"] for r in fetch_all("zryth_knowledge", "id", lambda q: q.eq("metadata->>source", filename))]
+    # delete by source in one statement (no huge IN list)
+    if ids:
+        sb.table("zryth_knowledge").delete().eq("metadata->>source", filename).execute()
+    log.info("Deleted %s: %d chunks", filename, len(ids))
+    return len(ids)
+
+
 def legacy_sources() -> list[str]:
     """Sources that have any row not produced by the current chunker."""
-    rows = _init_supabase().table("zryth_knowledge").select("metadata").execute().data
+    rows = fetch_all("zryth_knowledge", "id, metadata")
     return sorted({
         (r.get("metadata") or {}).get("source")
         for r in rows
@@ -107,7 +145,12 @@ def heal_legacy_chunks() -> list[str]:
             log.warning("Legacy rows for %s but file type unsupported; skipping", src)
             continue
         try:
-            ingest_source(src)
+            # keep the rows in the knowledge base they already belonged to
+            owner = (
+                _init_supabase().table("zryth_knowledge").select("agent_id")
+                .eq("metadata->>source", src).limit(1).execute().data
+            )
+            ingest_source(src, (owner[0].get("agent_id") if owner else None))
             fixed.append(src)
         except Exception:
             log.exception("Auto re-chunk failed for %s (rows left as they were)", src)

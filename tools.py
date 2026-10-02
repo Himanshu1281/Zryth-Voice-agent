@@ -7,19 +7,16 @@ import logging
 import asyncio
 import re
 import time
-from datetime import datetime, timezone
-from pathlib import Path
 from typing import Optional
 import os
-from functools import lru_cache
 
 from google import genai
 from livekit.agents import JobContext, RunContext, function_tool
 from livekit.agents.beta.workflows import WarmTransferTask
 
-from config import DEFAULT_TRANSFER_NUMBER
-from database import _init_supabase, log_knowledge_gap, update_call_lead
-from dynamic_executor import execute_tool_call
+from routing import DEFAULT_CONFIG, CallConfig
+from database import log_knowledge_gap, update_call_lead
+from dynamic_executor import execute_tool_call, is_executable
 
 # Initialize the Gemini client for embeddings
 if os.getenv('CI') or os.getenv('GITHUB_ACTIONS'):
@@ -30,38 +27,6 @@ else:
 log = logging.getLogger("voice-agent.tools")
 
 _cached_db = None
-
-DATA_DIR = Path(__file__).parent / "data"
-LEADS_PATH = DATA_DIR / "leads.json"
-
-
-def _load_leads() -> list[dict]:
-    """Load saved leads."""
-    if not LEADS_PATH.exists():
-        return []
-
-    try:
-        return json.loads(LEADS_PATH.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
-        return []
-
-
-def _save_lead(lead: dict) -> None:
-    """Save a lead locally.
-
-    This can later be replaced with an n8n webhook, CRM, Supabase,
-    Google Sheets, or another backend.
-    """
-    DATA_DIR.mkdir(exist_ok=True)
-
-    leads = _load_leads()
-    leads.append(lead)
-
-    LEADS_PATH.write_text(
-        json.dumps(leads, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-
 
 # Knowledge prefetch tuning (see AppointmentTools.retrieve_for_turn).
 # gemini-embedding-2 cosine scores on this KB: on-topic ~0.54-0.65, off-topic
@@ -106,9 +71,20 @@ def normalise_names(text: str) -> str:
 _SEARCH_TOP_K = 3
 
 
-def _vector_search(emb: list[float]) -> list[dict]:
-    """Blocking LanceDB lookup. Never re-syncs mid-call: the startup sync and the
-    realtime_sync_loop keep the table fresh; a missing table just means no results."""
+_UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+
+
+def _kb_filter(agent_id: str | None) -> str:
+    """LanceDB where-clause for one agent's knowledge ('' = rows without an agent)."""
+    if agent_id and not _UUID.match(agent_id):
+        raise ValueError(f"bad agent_id {agent_id!r}")
+    return f"agent_id = '{agent_id or ''}'"
+
+
+def _vector_search(emb: list[float], agent_id: str | None = None) -> list[dict]:
+    """Blocking LanceDB lookup, limited to one agent's knowledge base. Never re-syncs
+    mid-call: the startup sync and the realtime_sync_loop keep the table fresh; a
+    missing table just means no results."""
     global _cached_db
     import lancedb
     from database import LANCEDB_PATH
@@ -124,7 +100,11 @@ def _vector_search(emb: list[float]) -> list[dict]:
         return []
 
     table = _cached_db.open_table("knowledge")
-    return table.search(emb).metric("cosine").limit(_SEARCH_TOP_K).to_list()
+    return (
+        table.search(emb).metric("cosine")
+        .where(_kb_filter(agent_id), prefilter=True)
+        .limit(_SEARCH_TOP_K).to_list()
+    )
 
 
 # Small-KB fast path: while the whole knowledge base fits in this many chars
@@ -135,9 +115,9 @@ def _vector_search(emb: list[float]) -> list[dict]:
 KB_FULL_MAX_CHARS = int(os.getenv("KB_FULL_MAX_CHARS", "1500"))
 
 
-def load_full_kb() -> str | None:
-    """Whole KB from the local LanceDB copy (kept fresh by the realtime sync),
-    or None if it is empty/missing or too large for the prompt."""
+def load_full_kb(agent_id: str | None = None) -> str | None:
+    """One agent's whole KB from the local LanceDB copy (kept fresh by the realtime
+    sync), or None if it is empty/missing or too large for the prompt."""
     import lancedb
     from database import LANCEDB_PATH
 
@@ -147,7 +127,11 @@ def load_full_kb() -> str | None:
         db = lancedb.connect(LANCEDB_PATH)
         if "knowledge" not in db.table_names():
             return None
-        rows = db.open_table("knowledge").to_arrow().select(["id", "content"]).to_pylist()
+        table = db.open_table("knowledge")
+        rows = (
+            table.search().where(_kb_filter(agent_id), prefilter=True)
+            .select(["id", "content"]).limit(10_000).to_list()
+        )
     except Exception:
         log.exception("Could not load knowledge base for prompt; using retrieval")
         return None
@@ -160,11 +144,12 @@ def load_full_kb() -> str | None:
 _search_cache = {}
 _search_cache_lock = asyncio.Lock()
 
-async def _cached_search(query: str) -> tuple[tuple[str, ...], float]:
-    """Return (top chunks above the relevance floor, best similarity score)."""
+async def _cached_search(query: str, agent_id: str | None = None) -> tuple[tuple[str, ...], float]:
+    """Return (top chunks above the relevance floor, best similarity score) from one agent's KB."""
+    key = (agent_id or "", query)
     async with _search_cache_lock:
-        if query in _search_cache:
-            return _search_cache[query]
+        if key in _search_cache:
+            return _search_cache[key]
 
     try:
         res = await asyncio.wait_for(
@@ -174,7 +159,7 @@ async def _cached_search(query: str) -> tuple[tuple[str, ...], float]:
                     contents=query,
                 )
             ),
-            timeout=3.0,
+            timeout=_RETRIEVAL_TIMEOUT_S,
         )
     except asyncio.TimeoutError:
         log.warning("Gemini embedding timed out for query: %s", query)
@@ -183,7 +168,7 @@ async def _cached_search(query: str) -> tuple[tuple[str, ...], float]:
     emb = res.embeddings[0].values
 
     # LanceDB calls are synchronous -- run them off the event loop so audio never stalls.
-    results = await asyncio.to_thread(_vector_search, emb)
+    results = await asyncio.to_thread(_vector_search, emb, agent_id)
 
     scored = [
         (1.0 - row["_distance"], row["content"])
@@ -196,7 +181,7 @@ async def _cached_search(query: str) -> tuple[tuple[str, ...], float]:
     result = (tuple(dict.fromkeys(c for sc, c in scored if sc >= _RELEVANCE_FLOOR)), best)
     
     async with _search_cache_lock:
-        _search_cache[query] = result
+        _search_cache[key] = result
         if len(_search_cache) > 256:
             # simple prune
             _search_cache.pop(next(iter(_search_cache)))
@@ -257,11 +242,15 @@ def build_dynamic_tools(tool_specs: list[dict]) -> list:
         
         if not tool_name:
             continue
-            
-        def make_wrapper(name, json, instr):
-            async def _dynamic_wrapper(context: RunContext, raw_arguments: dict) -> dict:
+        if not is_executable(json_spec):
+            # e.g. an OpenAI-style {"type": "function"} spec: nothing to call
+            log.warning("Skipping tool %r: json_spec has no https http.url_template", tool_name)
+            continue
+
+        def make_wrapper(name, spec, instr):
+            async def _dynamic_wrapper(context: RunContext, raw_arguments: dict) -> str:
                 return await asyncio.to_thread(
-                    execute_tool_call, name, json, instr, raw_arguments
+                    execute_tool_call, name, spec, instr, raw_arguments
                 )
             return _dynamic_wrapper
             
@@ -270,7 +259,8 @@ def build_dynamic_tools(tool_specs: list[dict]) -> list:
         # LiveKit's function_tool supports `raw_schema` precisely for this!
         raw_schema = {
             "name": tool_name,
-            "description": instruction,
+            # LLM-facing text: json_spec.description if set, else the executor instruction.
+            "description": json_spec.get("description") or spec.get("description") or instruction,
             "parameters": json_spec.get("input_schema", {"type": "object", "properties": {}})
         }
         
@@ -280,12 +270,39 @@ def build_dynamic_tools(tool_specs: list[dict]) -> list:
     return dynamic_tools
 
 
-class AppointmentTools:
-    """Tools Maya can use during a Zryth customer call."""
+def _clean_phone(phone: str | None) -> str | None:
+    """Return a valid 10-digit Indian mobile number, or None.
 
-    def __init__(self, job_ctx: JobContext | None = None, call_id: str | None = None) -> None:
+    Accepts spaces, dashes, brackets and a +91 / 91 / 0 prefix
+    ("+91 98765-43210" -> "9876543210"). Must start with 6-9.
+    """
+    digits = re.sub(r"\D", "", phone or "")
+    if len(digits) == 12 and digits.startswith("91"):
+        digits = digits[2:]
+    elif len(digits) == 11 and digits.startswith("0"):
+        digits = digits[1:]
+    return digits if re.fullmatch(r"[6-9]\d{9}", digits) else None
+
+
+_BAD_PHONE_MSG = (
+    "That phone number is not a valid 10-digit mobile number. Read back what you heard "
+    "and ask the caller to repeat their 10-digit number. Do not save until it is valid."
+)
+
+
+class AppointmentTools:
+    """Tools the agent can use during a customer call."""
+
+    def __init__(
+        self,
+        job_ctx: JobContext | None = None,
+        call_id: str | None = None,
+        config: CallConfig = DEFAULT_CONFIG,
+    ) -> None:
         self.job_ctx = job_ctx
         self.call_id = call_id
+        # Which org agent answers: business name, knowledge base, transfer number
+        self.config = config
         self.is_ending = False
         self.is_transferring = False
         # Set by the entrypoint; arms the hang-up fallback timer.
@@ -295,7 +312,7 @@ class AppointmentTools:
 
     async def prepare_kb(self) -> None:
         """Load the KB once per call (local disk, a few ms)."""
-        self.full_kb = await asyncio.to_thread(load_full_kb)
+        self.full_kb = await asyncio.to_thread(load_full_kb, self.config.org_agent_id)
         log.info(
             "knowledge mode: %s",
             f"full KB in prompt ({len(self.full_kb)} chars)" if self.full_kb else "per-turn retrieval",
@@ -314,25 +331,21 @@ class AppointmentTools:
         self,
         context: RunContext,
         name: str,
-        phone: Optional[str] = None,
-        email: Optional[str] = None,
-        company: Optional[str] = None,
+        phone: str,
         requirement: Optional[str] = None,
     ) -> dict:
-        """Log a potential customer's contact details and interest.
+        """Save an interested caller's name and phone number.
 
-        Use ONLY when the caller has expressed general interest in Zryth's services
-        but has NOT asked to schedule or book a specific meeting.
-        If they mention a date, time, or say "book/schedule a call", use
-        `book_consultation` instead.
+        Use when the caller shows interest but has NOT asked to book a meeting
+        (for a date/time or "book a call", use `book_consultation`).
+        Ask the caller ONLY for their name and 10-digit phone number. Never ask
+        for email, company, or anything else.
 
         Args:
-            name: Caller's full name.
-            phone: Caller's phone number, if provided.
-            email: Caller's email address, if provided.
-            company: Company or organization name, if relevant.
-            requirement: Short summary of what the caller wants to build,
-                automate, integrate, or improve with AI/software.
+            name: Caller's name.
+            phone: Caller's 10-digit mobile number.
+            requirement: What they want, summarised by you from the conversation
+                (do NOT ask the caller for this).
         """
 
         if not name or not name.strip():
@@ -340,15 +353,16 @@ class AppointmentTools:
                 "status": "failed",
                 "message": "Name is required. Please ask the caller for their name before proceeding.",
             }
+        clean = _clean_phone(phone)
+        if not clean:
+            return {"status": "failed", "message": _BAD_PHONE_MSG}
 
         if self.call_id:
             await asyncio.to_thread(
                 update_call_lead,
                 call_id=self.call_id,
-                customer_name=name,
-                phone=phone,
-                email=email,
-                company=company,
+                customer_name=name.strip(),
+                phone=clean,
                 requirement=requirement,
             )
 
@@ -379,7 +393,7 @@ class AppointmentTools:
             return tuple()
         t0 = time.perf_counter()
         try:
-            chunks, best = await asyncio.wait_for(_cached_search(text), timeout=_RETRIEVAL_TIMEOUT_S)
+            chunks, best = await asyncio.wait_for(_cached_search(text, self.config.org_agent_id), timeout=_RETRIEVAL_TIMEOUT_S)
         except asyncio.TimeoutError:
             log.warning("knowledge prefetch timed out for: %s", text)
             return tuple()
@@ -404,27 +418,25 @@ class AppointmentTools:
         self,
         context: RunContext,
         name: str,
-        phone: Optional[str] = None,
-        email: Optional[str] = None,
-        company: Optional[str] = None,
+        phone: str,
         requirement: Optional[str] = None,
         preferred_date: Optional[str] = None,
         preferred_time: Optional[str] = None,
     ) -> dict:
-        """Record a consultation request for the Zryth team.
+        """Record a consultation request for the team.
 
-        Use ONLY when the caller explicitly asks to schedule or book a meeting/call,
-        OR agrees when you offer one. If they've only expressed general interest with
-        no scheduling intent, use `capture_lead` instead.
+        Use ONLY when the caller asks to schedule or book a meeting/call, or agrees
+        when you offer one; otherwise use `capture_lead`.
+        Ask the caller ONLY for their name, 10-digit phone number and (optionally)
+        a preferred date/time. Never ask for email, company, or anything else.
 
         Args:
-            name: Caller's full name.
-            phone: Caller's phone number.
-            email: Caller's email address.
-            company: Company or organization name, if relevant.
-            requirement: Brief description of the project or business problem.
-            preferred_date: Preferred consultation date, if provided.
-            preferred_time: Preferred consultation time, if provided.
+            name: Caller's name.
+            phone: Caller's 10-digit mobile number.
+            requirement: What they want, summarised by you from the conversation
+                (do NOT ask the caller for this).
+            preferred_date: Preferred date, if the caller gave one.
+            preferred_time: Preferred time, if the caller gave one.
         """
 
         if not name or not name.strip():
@@ -432,15 +444,16 @@ class AppointmentTools:
                 "status": "failed",
                 "message": "Name is required. Please ask the caller for their name before proceeding.",
             }
+        clean = _clean_phone(phone)
+        if not clean:
+            return {"status": "failed", "message": _BAD_PHONE_MSG}
 
         if self.call_id:
             await asyncio.to_thread(
                 update_call_lead,
                 call_id=self.call_id,
-                customer_name=name,
-                phone=phone,
-                email=email,
-                company=company,
+                customer_name=name.strip(),
+                phone=clean,
                 requirement=_with_preferred_slot(requirement, preferred_date, preferred_time),
             )
 
@@ -450,7 +463,7 @@ class AppointmentTools:
             "status": "requested",
             "message": (
                 "The consultation request has been recorded. "
-                "The Zryth team will follow up to confirm the appointment."
+                f"The {self.config.business_name} team will follow up to confirm the appointment."
             ),
         }
 
@@ -459,7 +472,7 @@ class AppointmentTools:
         self,
         context: RunContext,
     ) -> dict:
-        """Transfer the caller to a Zryth team member.
+        """Transfer the caller to a human team member.
 
         Use when the caller asks to be transferred, to speak with a human or
         someone from the team, or the request requires human assistance.
@@ -470,13 +483,15 @@ class AppointmentTools:
         sip_trunk_id = os.getenv("LIVEKIT_SIP_OUTBOUND_TRUNK")
         sip_number = os.getenv("LIVEKIT_SIP_NUMBER")
 
-        if not sip_trunk_id:
+        transfer_to = self.config.transfer_number
+        if not sip_trunk_id or not transfer_to:
             log.error(
-                "transfer_to_human: LIVEKIT_SIP_OUTBOUND_TRUNK not set — SIP warm transfer unavailable."
+                "transfer_to_human unavailable (outbound trunk set=%s, transfer number set=%s)",
+                bool(sip_trunk_id), bool(transfer_to),
             )
             return (
-                "I'm sorry, the transfer service is not configured yet. "
-                "The Zryth team will call you back directly."
+                "I'm sorry, I can't transfer calls right now. "
+                f"The {self.config.business_name} team will call you back directly."
             )
 
         # Blocks the silence check / hang-up logic while the caller is on hold.
@@ -487,7 +502,7 @@ class AppointmentTools:
             await context.wait_for_playout()
 
             result = await WarmTransferTask(
-                sip_call_to=DEFAULT_TRANSFER_NUMBER,
+                sip_call_to=transfer_to,
                 sip_trunk_id=sip_trunk_id,
                 sip_number=sip_number,
                 chat_ctx=context.session.history,
@@ -506,7 +521,7 @@ class AppointmentTools:
             log.exception(
                 "Human transfer failed (trunk=%s, to=%s)",
                 sip_trunk_id,
-                DEFAULT_TRANSFER_NUMBER,
+                transfer_to,
             )
             return (
                 "I was unable to connect you to a team member right now. "
@@ -538,8 +553,6 @@ class AppointmentTools:
 
 
 if __name__ == "__main__":
-    DATA_DIR.mkdir(exist_ok=True)
-
     print("tools.py self-check passed")
     print("Zryth tools available:")
     print("- capture_lead")
