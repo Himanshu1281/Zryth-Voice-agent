@@ -26,6 +26,9 @@ _lancedb_sync_lock = threading.Lock()
 PAGE_SIZE = 1000
 # Safety net when Realtime events are missed: full resync at least this often.
 KB_RESYNC_INTERVAL_S = int(os.getenv("KB_RESYNC_INTERVAL_S", "600"))
+# Syncs are incremental by (id, agent_id); a full rebuild this often also catches
+# chunks whose content was edited in place.
+KB_FULL_RESYNC_INTERVAL_S = int(os.getenv("KB_FULL_RESYNC_INTERVAL_S", "86400"))
 
 
 def fetch_all(table: str, columns: str, apply=None) -> list[dict]:
@@ -275,14 +278,99 @@ def _load_tools(agent_id: str) -> list[dict] | None:
         log.error(f"Failed to fetch assigned tools for '{agent_id}': {e}")
         return None
 
-def sync_knowledge_to_lancedb() -> None:
-    """Sync Supabase knowledge base to local LanceDB."""
+def _to_lance_rows(data: list[dict]) -> list[dict]:
+    rows = []
+    for row in data:
+        try:
+            rows.append(
+                {
+                    "id": row["id"],
+                    "content": row["content"],
+                    "vector": json.loads(row["embedding"]),
+                    # '' = rows without an agent; searches filter on this per call
+                    "agent_id": row.get("agent_id") or "",
+                }
+            )
+        except Exception as e:
+            log.warning(f"Failed to parse embedding for row {row['id']}: {e}")
+    return rows
+
+
+def _sql_list(ids) -> str:
+    return ", ".join(
+        str(i) if isinstance(i, int) else "'" + str(i).replace("'", "''") + "'" for i in ids
+    )
+
+
+def _cleanup_versions(table) -> None:
+    """Compact the small fragments incremental syncs create and drop old versions.
+    10 minutes of history is kept so a reader mid-search never loses its files."""
+    try:
+        table.optimize(cleanup_older_than=timedelta(minutes=10))
+    except Exception:
+        try:
+            table.cleanup_old_versions(older_than=timedelta(minutes=10))
+        except Exception:
+            log.exception("LanceDB version cleanup failed")
+
+
+def _incremental_sync(table) -> bool:
+    """Apply only the differences between Supabase and the local table, comparing
+    (id, agent_id) and downloading full rows just for new/changed chunks. Returns
+    False when it cannot run (caller does a full rebuild). Ingest and heal always
+    replace chunks with new ids, so in-place content edits are only caught by the
+    daily full rebuild."""
+    remote = {str(r["id"]): (r["id"], r.get("agent_id") or "") for r in fetch_all("zryth_knowledge", "id, agent_id")}
+    if not remote:
+        return False
+    n = table.count_rows()
+    local = {
+        str(r["id"]): (r["id"], r.get("agent_id") or "")
+        for r in table.search().select(["id", "agent_id"]).limit(max(n, 1)).to_list()
+    }
+
+    to_delete = [local[k][0] for k in local if k not in remote or remote[k][1] != local[k][1]]
+    to_add = [remote[k][0] for k in remote if k not in local or remote[k][1] != local[k][1]]
+    if not to_delete and not to_add:
+        log.info("LanceDB already up to date (%d rows).", len(local))
+        return True
+
+    new_rows = []
+    for i in range(0, len(to_add), 200):
+        batch = to_add[i:i + 200]
+        data = (
+            _init_supabase().table("zryth_knowledge")
+            .select("id, content, embedding, agent_id").in_("id", batch).execute().data or []
+        )
+        new_rows.extend(_to_lance_rows(data))
+
+    for i in range(0, len(to_delete), 500):
+        table.delete(f"id IN ({_sql_list(to_delete[i:i + 500])})")
+    if new_rows:
+        table.add(new_rows)
+    _cleanup_versions(table)
+    log.info("LanceDB incremental sync: +%d / -%d rows.", len(new_rows), len(to_delete))
+    return True
+
+
+def sync_knowledge_to_lancedb(full: bool = False) -> None:
+    """Sync Supabase knowledge base to local LanceDB: incremental by default,
+    full rebuild when the table is missing, the diff fails, or full=True."""
 
     if not _lancedb_sync_lock.acquire(blocking=False):
         log.info("LanceDB sync already in progress. Skipping duplicate sync.")
         return
 
     try:
+        if not full and os.path.exists(LANCEDB_PATH):
+            db = lancedb.connect(LANCEDB_PATH)
+            if "knowledge" in db.table_names():
+                try:
+                    if _incremental_sync(db.open_table("knowledge")):
+                        return
+                except Exception:
+                    log.exception("Incremental LanceDB sync failed; doing a full rebuild")
+
         data = fetch_all("zryth_knowledge", "id, content, embedding, agent_id")
 
         if not data:
@@ -295,27 +383,7 @@ def sync_knowledge_to_lancedb() -> None:
                     local.drop_table("knowledge")
             return
 
-        lancedb_data = []
-
-        for row in data:
-            try:
-                vec = json.loads(row["embedding"])
-
-                lancedb_data.append(
-                    {
-                        "id": row["id"],
-                        "content": row["content"],
-                        "vector": vec,
-                        # '' = rows without an agent; searches filter on this per call
-                        "agent_id": row.get("agent_id") or "",
-                    }
-                )
-
-            except Exception as e:
-                log.warning(
-                    f"Failed to parse embedding for row "
-                    f"{row['id']}: {e}"
-                )
+        lancedb_data = _to_lance_rows(data)
 
         if not lancedb_data:
             log.warning("No valid knowledge rows to write to LanceDB.")
@@ -331,11 +399,12 @@ def sync_knowledge_to_lancedb() -> None:
 
         db = lancedb.connect(LANCEDB_PATH)
 
-        db.create_table(
+        table = db.create_table(
             "knowledge",
             data=lancedb_data,
             mode="overwrite",
         )
+        _cleanup_versions(table)
 
         log.info(
             "Successfully synced %d rows to local LanceDB.",
@@ -394,6 +463,7 @@ async def realtime_sync_loop() -> None:
 
     asyncio.create_task(_subscribe_forever())
     asyncio.create_task(_periodic())
+    last_full = time.monotonic()  # startup already did a sync
 
     while True:
         await sync_queue.get()
@@ -416,8 +486,11 @@ async def realtime_sync_loop() -> None:
             except Exception:
                 log.exception("Legacy chunk healing failed; syncing rows as they are")
 
+        full = time.monotonic() - last_full >= KB_FULL_RESYNC_INTERVAL_S
         try:
-            await asyncio.to_thread(sync_knowledge_to_lancedb)
+            await asyncio.to_thread(sync_knowledge_to_lancedb, full)
+            if full:
+                last_full = time.monotonic()
         except Exception:
             log.exception("Error syncing LanceDB")
 

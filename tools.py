@@ -144,9 +144,25 @@ def load_full_kb(agent_id: str | None = None) -> str | None:
 _search_cache = {}
 _search_cache_lock = asyncio.Lock()
 
+
+def _kb_version() -> int | None:
+    """Current version of the local 'knowledge' table. Every sync (from this process,
+    the realtime thread or the webhook service) bumps it, so keying the cache on it
+    drops stale answers without a restart."""
+    import lancedb
+    from database import LANCEDB_PATH
+
+    try:
+        if not os.path.exists(LANCEDB_PATH):
+            return None
+        return lancedb.connect(LANCEDB_PATH).open_table("knowledge").version
+    except Exception:
+        return None
+
+
 async def _cached_search(query: str, agent_id: str | None = None) -> tuple[tuple[str, ...], float]:
     """Return (top chunks above the relevance floor, best similarity score) from one agent's KB."""
-    key = (agent_id or "", query)
+    key = (await asyncio.to_thread(_kb_version), agent_id or "", query)
     async with _search_cache_lock:
         if key in _search_cache:
             return _search_cache[key]

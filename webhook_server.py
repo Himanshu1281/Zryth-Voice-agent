@@ -6,7 +6,6 @@ from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
 import urllib.request
 import json
-from database import sync_knowledge_to_lancedb
 
 logging.basicConfig(level=logging.INFO)
 
@@ -64,11 +63,11 @@ async def knowledge_sync(
             except Exception:
                 log.exception("Legacy chunk healing failed; syncing rows as they are")
 
-        sync_knowledge_to_lancedb()
-
+        # LanceDB is written only by the voice-agent's sync thread (one writer per
+        # host); it picks this change up from the Supabase Realtime event.
         return {
             "status": "ok",
-            "message": "LanceDB synchronization completed",
+            "message": "Supabase updated; agents sync LanceDB via Realtime",
             "rechunked": fixed,
         }
 
@@ -111,8 +110,7 @@ async def knowledge_ingest(
         log.exception("Ingest failed for %s", req.filename)
         raise HTTPException(status_code=500, detail="Ingest failed")
 
-    # Refresh this host's LanceDB now instead of waiting for the realtime event.
-    await run_in_threadpool(sync_knowledge_to_lancedb)
+    # Every agent host's sync thread applies the new rows from the Realtime event.
     return {"status": "ok", "filename": req.filename, "chunks": count}
 
 
@@ -133,7 +131,6 @@ async def knowledge_delete(
 
     try:
         removed = await run_in_threadpool(delete_source, req.filename)
-        await run_in_threadpool(sync_knowledge_to_lancedb)
     except Exception:
         log.exception("Delete failed for %s", req.filename)
         raise HTTPException(status_code=500, detail="Delete failed")
