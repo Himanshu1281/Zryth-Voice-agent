@@ -54,6 +54,11 @@ _NAME_ALIASES = [
     (re.compile(r"\b(?:zyrth|zrith|zerith|zirith|zirth|zerth|zareth|zarith|zarid|zerid|zaret)\b", re.I), "Zryth"),
 ]
 
+# A bare "no" answering "anything else?" also means the caller is done.
+_SHORT_NO = re.compile(
+    r"^\W*(?:no|nope|nah|no no|nothing|not really|nahi|nahin|नहीं|ना|जी नहीं)\W*$", re.I
+)
+
 # Spoken by end_call itself, so every call ends the same polite way.
 _GOODBYES = {
     "en": "Thank you for calling {business}. Have a great day, goodbye!",
@@ -643,19 +648,23 @@ class AppointmentTools:
 
         # The LLM sometimes hangs up on fragments like "Sorry" or "First". Only end
         # when the caller's latest words actually sound like they're done.
-        last_user = ""
+        last_user, spoke_after = "", False
         try:
-            last_user = next(
-                (m.text_content or "" for m in reversed(context.session.history.items)
-                 if getattr(m, "role", None) == "user" and m.text_content),
-                "",
-            )
+            for m in reversed(context.session.history.items):
+                role = getattr(m, "role", None)
+                if role == "assistant" and m.text_content:
+                    spoke_after = True  # Maya already replied after the caller's turn
+                elif role == "user" and m.text_content:
+                    last_user = m.text_content
+                    break
         except Exception:
             log.exception("end_call: could not read history")
-        if last_user and not _GOODBYE.search(last_user):
+        if last_user and not (_GOODBYE.search(last_user) or _SHORT_NO.match(last_user)):
             log.info("end_call refused; caller said %r", last_user)
-            # None = no tool reply, so Maya doesn't speak a second time.
-            return None
+            if spoke_after:
+                return None  # she already answered; a tool reply would make her speak twice
+            # Nothing said this turn yet: have her reply instead of leaving dead air.
+            return "Don't end the call yet. Reply to what the caller just said."
 
         # Lead backstop: one callback offer before hanging up on a caller whose
         # details weren't saved. Asked only once, so nobody gets trapped.
