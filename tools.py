@@ -340,6 +340,25 @@ def _missing_details(name: str | None, phone: str | None) -> dict | None:
     }
 
 
+def _spoken_digits(phone: str) -> str:
+    """'8591194506' -> '8 5 9 1 1 9 4 5 0 6' so Maya reads it digit by digit."""
+    return " ".join(phone)
+
+
+def _user_said_digits(context: RunContext, digits: str) -> bool:
+    """True when the caller's own transcripts contain this number."""
+    try:
+        said = "".join(
+            re.sub(r"\D", "", m.text_content or "")
+            for m in context.session.history.items
+            if getattr(m, "role", None) == "user"
+        )
+    except Exception:
+        log.exception("could not read history for phone check")
+        return True  # don't block saving on an SDK change
+    return digits in said
+
+
 class AppointmentTools:
     """Tools the agent can use during a customer call."""
 
@@ -359,6 +378,12 @@ class AppointmentTools:
         self.on_end_requested = None
         # Whole KB for the system prompt (small-KB fast path); None = retrieve per turn.
         self.full_kb: str | None = None
+        # Number the caller is dialling from (set by the entrypoint).
+        self.caller_phone: str | None = None
+        # (name, phone) already saved this call -- stops duplicate bookings.
+        self.saved_contact: tuple[str, str] | None = None
+        # end_call defers once to offer a callback when no details were saved.
+        self.callback_offered = False
 
     async def prepare_kb(self) -> None:
         """Load the KB once per call (local disk, a few ms)."""
@@ -398,27 +423,67 @@ class AppointmentTools:
                 (do NOT ask the caller for this).
         """
 
+        return await self._save_contact(context, "capture_lead", name, phone, requirement)
+
+    async def _save_contact(
+        self, context: RunContext, tool: str, name: str, phone: str, requirement: Optional[str]
+    ) -> dict:
+        """Shared by capture_lead/book_consultation: validate, de-duplicate, save,
+        then have Maya confirm the name and read the number back."""
         missing = _missing_details(name, phone)
         if missing:
             return missing
         clean = _clean_phone(phone)
         if not clean:
             return {"status": "failed", "message": _BAD_PHONE_MSG}
+        # The LLM sometimes invents a number (e.g. the 9876543210 example). Accept
+        # only the caller ID or digits the caller actually said.
+        caller = _clean_phone(self.caller_phone)
+        if clean != caller and not _user_said_digits(context, clean):
+            log.warning("%s: rejected number %s not said by caller", tool, clean)
+            offer = (
+                f"Ask whether the team should call them on the number they're calling from "
+                f"({_spoken_digits(caller)}), or on another number."
+                if caller else "Ask the caller for their ten-digit mobile number."
+            )
+            return {
+                "status": "failed",
+                "message": f"Nothing saved: the caller never gave that number. {offer}",
+            }
+
+        name = name.strip()
+        if self.saved_contact == (name, clean):
+            return {
+                "status": "already_saved",
+                "message": "This is already recorded. Do not mention it again; just reply to the caller.",
+            }
+        updating = self.saved_contact is not None
 
         if self.call_id:
             await asyncio.to_thread(
                 update_call_lead,
                 call_id=self.call_id,
-                customer_name=name.strip(),
+                customer_name=name,
                 phone=clean,
                 requirement=requirement,
             )
+        self.saved_contact = (name, clean)
+        log.info("%s -> %s", tool, name)
 
-        log.info("capture_lead -> %s", name)
-
+        if updating:
+            return {
+                "status": "updated",
+                "message": f"Updated to {name}, {_spoken_digits(clean)}. Briefly confirm the change.",
+            }
+        what = "consultation request" if tool == "book_consultation" else "details"
         return {
             "status": "saved",
-            "message": "The customer enquiry has been recorded successfully.",
+            "message": (
+                f"Saved. In one reply: tell {name} their {what} is recorded and the "
+                f"{self.config.business_name} team will contact them, read the number back digit by digit "
+                f"({_spoken_digits(clean)}), and ask if they'd prefer a different number. "
+                "If they give another number, call this tool again with it."
+            ),
         }
 
     async def _log_gap(self, query: str) -> None:
@@ -487,31 +552,10 @@ class AppointmentTools:
             preferred_time: Preferred time, if the caller gave one.
         """
 
-        missing = _missing_details(name, phone)
-        if missing:
-            return missing
-        clean = _clean_phone(phone)
-        if not clean:
-            return {"status": "failed", "message": _BAD_PHONE_MSG}
-
-        if self.call_id:
-            await asyncio.to_thread(
-                update_call_lead,
-                call_id=self.call_id,
-                customer_name=name.strip(),
-                phone=clean,
-                requirement=_with_preferred_slot(requirement, preferred_date, preferred_time),
-            )
-
-        log.info("book_consultation -> %s", name)
-
-        return {
-            "status": "requested",
-            "message": (
-                "The consultation request has been recorded. "
-                f"The {self.config.business_name} team will follow up to confirm the appointment."
-            ),
-        }
+        return await self._save_contact(
+            context, "book_consultation", name, phone,
+            _with_preferred_slot(requirement, preferred_date, preferred_time),
+        )
 
     @function_tool
     async def transfer_to_human(
@@ -579,7 +623,7 @@ class AppointmentTools:
     async def end_call(
         self,
         context: RunContext,
-    ) -> str:
+    ) -> str | None:
         """Initiates the call termination sequence. Use when the conversation is finished."""
 
         log.info("end_call requested by Maya")
@@ -604,9 +648,23 @@ class AppointmentTools:
             log.exception("end_call: could not read history")
         if last_user and not _GOODBYE.search(last_user):
             log.info("end_call refused; caller said %r", last_user)
+            # None = no tool reply, so Maya doesn't speak a second time.
+            return None
+
+        # Lead backstop: one callback offer before hanging up on a caller whose
+        # details weren't saved. Asked only once, so nobody gets trapped.
+        if self.saved_contact is None and not self.callback_offered and not self.is_transferring:
+            self.callback_offered = True
+            log.info("end_call deferred once for a callback offer")
+            ask = (
+                "should our team call you back on this number with more details?"
+                if _clean_phone(self.caller_phone)
+                else "may I take your number so our team can call you back with more details?"
+            )
             return (
-                "Do NOT end the call: the caller has not said goodbye. "
-                "Reply to what they just said, or ask how you can help."
+                "Don't hang up yet. If you haven't already offered a callback, ask in one short sentence: "
+                f"\"Before you go, {ask}\" If you already offered and they declined, just say a brief "
+                "goodbye and call end_call again."
             )
 
         if not self.is_ending:

@@ -123,7 +123,7 @@ FILLERS: dict[str, tuple[str, ...]] = {
     "en": ("Let me check.", "One moment.", "Sure, let me see."),
     "hi": ("एक सेकंड, देखती हूँ।", "जी, बस एक पल।", "ठीक है, देखती हूँ।"),
 }
-FILLER_DELAY_S = 0.6  # lookups faster than this get no filler
+FILLER_DELAY_S = 1.2  # lookups (normally ~0.6 s) faster than this get no filler
 
 
 # --- pipeline wiring ---------------------------------------------------------
@@ -233,6 +233,13 @@ def _compose_instructions(code: str, caller_phone: str | None, kb: "AppointmentT
 # Markdown the LLM may emit despite instructions: **bold**, *, #, `, and "- " bullets.
 _MARKDOWN = re.compile(r"[*#`_]+|^\s*[-•]\s+", re.M)
 
+# Caller is asking something (worth a "let me check" if the lookup is slow).
+_QUESTION = re.compile(
+    r"\?|\b(?:what|which|how|why|when|where|who|can you|could you|tell me|explain|do you|does)\b"
+    r"|क्या|कैसे|कौन|कब|कहाँ|क्यों|बताइए|बताओ|बता",
+    re.I,
+)
+
 _DEVANAGARI = re.compile(r"[ऀ-ॿ]")
 _LATIN = re.compile(r"[A-Za-z]")
 
@@ -335,7 +342,10 @@ class BaseMayaAgent(Agent):
             ]
             if prev:
                 text = f"{prev[-1]} {text}"
-        filler = asyncio.create_task(self._filler_after(FILLER_DELAY_S))
+        # Only questions get "let me check" -- never names, numbers or "okay".
+        filler = asyncio.create_task(
+            self._filler_after(FILLER_DELAY_S) if _QUESTION.search(text) else asyncio.sleep(0)
+        )
         try:
             chunks = await self.kb.retrieve_for_turn(text)
         finally:
@@ -657,6 +667,7 @@ async def entrypoint(ctx: JobContext) -> None:
 
     session.on("agent_state_changed", on_agent_state_changed)
     tools_instance.on_end_requested = lambda: asyncio.create_task(_hang_up_fallback())
+    tools_instance.caller_phone = phone
 
     await session.start(
         agent=GreeterAgent(caller_phone=phone, kb=tools_instance, language=config.language),
