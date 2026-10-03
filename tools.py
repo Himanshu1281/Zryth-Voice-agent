@@ -54,6 +54,12 @@ _NAME_ALIASES = [
     (re.compile(r"\b(?:zyrth|zrith|zerith|zirith|zirth|zerth|zareth|zarith|zarid|zerid|zaret)\b", re.I), "Zryth"),
 ]
 
+# Spoken by end_call itself, so every call ends the same polite way.
+_GOODBYES = {
+    "en": "Thank you for calling {business}. Have a great day, goodbye!",
+    "hi": "{business} को कॉल करने के लिए धन्यवाद। आपका दिन शुभ हो, नमस्ते!",
+}
+
 # Caller is wrapping up: only then may end_call actually hang up.
 _GOODBYE = re.compile(
     r"\b(?:bye|goodbye|good night|that's all|thats all|that is all|no thanks?|nothing else|"
@@ -667,11 +673,19 @@ class AppointmentTools:
                 "goodbye and call end_call again."
             )
 
-        if not self.is_ending:
-            self.is_ending = True
-            if self.on_end_requested:
-                self.on_end_requested()
-        return "Call will end after your goodbye. Say a brief, polite goodbye now."
+        if self.is_ending:
+            return None
+        self.is_ending = True
+        if self.on_end_requested:
+            self.on_end_requested()
+        # Fixed goodbye (like the original agent): predictable, and the hang-up
+        # fires once it finishes playing. None = the LLM adds nothing after it.
+        lang = getattr(context.session.current_agent, "code", "en")
+        context.session.say(
+            _GOODBYES.get(lang, _GOODBYES["en"]).format(business=self.config.business_name),
+            allow_interruptions=False,
+        )
+        return None
 
 
 if __name__ == "__main__":

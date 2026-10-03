@@ -240,6 +240,15 @@ _QUESTION = re.compile(
     re.I,
 )
 
+# Statements that still need facts ("I want to know about the mill software").
+_TOPIC = re.compile(
+    r"\b(?:about|know|service|services|product|products|software|price|pricing|cost|offer|"
+    r"build|create|make|develop|automate|custom|chatbot|app|website|AI|features?|company|contact|"
+    r"whatsapp|email|address|located|clients?)\b"
+    r"|बारे|सर्विस|प्रोडक्ट|सॉफ्टवेयर|कीमत|कंपनी|company|software",
+    re.I,
+)
+
 _DEVANAGARI = re.compile(r"[ऀ-ॿ]")
 _LATIN = re.compile(r"[A-Za-z]")
 
@@ -334,6 +343,12 @@ class BaseMayaAgent(Agent):
             # the vector lookup in the background only to log knowledge gaps.
             asyncio.create_task(self.kb.retrieve_for_turn(text))
             return
+        # Only look things up when the caller asks about something. Names, "okay",
+        # numbers and small talk get a plain conversational reply: no facts block
+        # for the LLM to recite, and no lookup wait.
+        asking = bool(_QUESTION.search(text) or _TOPIC.search(text))
+        if not asking:
+            return
         # Short follow-ups ("what's its price?") need the previous question for context.
         if len(text.split()) < 6:
             prev = [
@@ -342,10 +357,7 @@ class BaseMayaAgent(Agent):
             ]
             if prev:
                 text = f"{prev[-1]} {text}"
-        # Only questions get "let me check" -- never names, numbers or "okay".
-        filler = asyncio.create_task(
-            self._filler_after(FILLER_DELAY_S) if _QUESTION.search(text) else asyncio.sleep(0)
-        )
+        filler = asyncio.create_task(self._filler_after(FILLER_DELAY_S))
         try:
             chunks = await self.kb.retrieve_for_turn(text)
         finally:

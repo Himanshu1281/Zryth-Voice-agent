@@ -53,7 +53,7 @@ GROQ_REASONING_EFFORT = os.getenv("GROQ_REASONING_EFFORT", "none")
 LLM_MODEL = os.getenv("LLM_MODEL", "gemini-2.5-flash-lite")
 LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.3"))
 # Hard cap on reply length. Short replies = lower TTS/LLM latency on a phone call.
-MAX_TOKENS = int(os.getenv("MAX_TOKENS", "90"))
+MAX_TOKENS = int(os.getenv("MAX_TOKENS", "150"))
 
 
 # --- Agent behaviour ---------------------------------------------------------
