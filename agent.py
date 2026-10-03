@@ -230,6 +230,9 @@ def _compose_instructions(code: str, caller_phone: str | None, kb: "AppointmentT
     return _with_caller(text, caller_phone)
 
 
+# Markdown the LLM may emit despite instructions: **bold**, *, #, `, and "- " bullets.
+_MARKDOWN = re.compile(r"[*#`_]+|^\s*[-•]\s+", re.M)
+
 _DEVANAGARI = re.compile(r"[ऀ-ॿ]")
 _LATIN = re.compile(r"[A-Za-z]")
 
@@ -290,6 +293,17 @@ class BaseMayaAgent(Agent):
             log.warning("LLM returned an empty reply (attempt %d)", attempt + 1)
         yield EMPTY_REPLY_FALLBACK.get(self.code, EMPTY_REPLY_FALLBACK["en"])
 
+    async def tts_node(self, text, model_settings):
+        """Strip markdown (bullets, **bold**, #) the LLM sometimes emits, so the
+        TTS never reads symbols aloud."""
+        async def _clean(stream):
+            async for chunk in stream:
+                chunk = _MARKDOWN.sub("", chunk)
+                if chunk:
+                    yield chunk
+        async for frame in Agent.default.tts_node(self, _clean(text), model_settings):
+            yield frame
+
     async def on_user_turn_completed(
         self, turn_ctx: agents.llm.ChatContext, new_message: agents.llm.ChatMessage
     ) -> None:
@@ -333,7 +347,8 @@ class BaseMayaAgent(Agent):
                 role="system",
                 content=(
                     f"Relevant {self.kb.config.business_name} knowledge (reference only; never read it out verbatim, "
-                    "answer the caller in your own short words):\n" + "\n\n".join(chunks)
+                    "answer only what was asked in at most 2 short spoken sentences, no lists or markdown):\n"
+                    + "\n\n".join(chunks)
                 ),
             )
 

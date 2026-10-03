@@ -51,8 +51,16 @@ _NAME_ALIASES = [
     (re.compile(r"(?:उस ?वाले?|ओ[सस्]+वाल|एशो)\s+(?:ए\s?आई|एआई|ऐसे|आए|ए|AI|oil)(?=[\s।.?!,]|$)", re.I), "Oswaal AI"),
     (re.compile(r"ओस्?वाल"), "Oswaal"),
     (re.compile(r"\b(?:oswal|oswall|osval|oswaal)\b", re.I), "Oswaal"),
-    (re.compile(r"\b(?:zyrth|zrith|zerith|zareth|zarith|zarid|zerid|zaret)\b", re.I), "Zryth"),
+    (re.compile(r"\b(?:zyrth|zrith|zerith|zirith|zirth|zerth|zareth|zarith|zarid|zerid|zaret)\b", re.I), "Zryth"),
 ]
+
+# Caller is wrapping up: only then may end_call actually hang up.
+_GOODBYE = re.compile(
+    r"\b(?:bye|goodbye|good night|that's all|thats all|that is all|no thanks?|nothing else|"
+    r"not now|that's it|thats it|i'm done|im done|hang up|cut the call|done|thank you|thanks|"
+    r"ok bye|chalo|rakhta|rakhti)\b|धन्यवाद|शुक्रिया|बाय|बस इतना|और कुछ नहीं|रखता|रखती",
+    re.I,
+)
 
 
 _PRICING_Q = re.compile(
@@ -582,6 +590,24 @@ class AppointmentTools:
             
         if hasattr(context.session, "_closed") and context.session._closed:
             return ""
+
+        # The LLM sometimes hangs up on fragments like "Sorry" or "First". Only end
+        # when the caller's latest words actually sound like they're done.
+        last_user = ""
+        try:
+            last_user = next(
+                (m.text_content or "" for m in reversed(context.session.history.items)
+                 if getattr(m, "role", None) == "user" and m.text_content),
+                "",
+            )
+        except Exception:
+            log.exception("end_call: could not read history")
+        if last_user and not _GOODBYE.search(last_user):
+            log.info("end_call refused; caller said %r", last_user)
+            return (
+                "Do NOT end the call: the caller has not said goodbye. "
+                "Reply to what they just said, or ask how you can help."
+            )
 
         if not self.is_ending:
             self.is_ending = True
