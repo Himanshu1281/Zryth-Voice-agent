@@ -112,6 +112,17 @@ log = logging.getLogger("voice-agent")
 METRICS_LOG = Path(__file__).parent / "logs" / "metrics.jsonl"
 
 # Spoken when the LLM returns nothing, so the caller never hears dead air.
+# Used instead when the empty reply follows a tool result (e.g. a rejected phone
+# number): "say that once more" makes no sense to the caller there.
+TOOL_REPLY_FALLBACK: dict[str, str] = {
+    "en": "Sorry, I didn't get the full number. Could you tell me all ten digits, please?",
+    "hi": "माफ़ कीजिए, पूरा नंबर नहीं मिला। क्या आप दसों अंक एक साथ बता सकते हैं?",
+}
+GENERIC_TOOL_FALLBACK: dict[str, str] = {
+    "en": "Sorry, give me just a moment. Could you say that again?",
+    "hi": "माफ़ कीजिए, एक पल। क्या आप फिर से बता सकते हैं?",
+}
+
 EMPTY_REPLY_FALLBACK: dict[str, str] = {
     "en": "Sorry, could you say that once more?",
     "hi": "माफ़ कीजिए, क्या आप एक बार फिर से बता सकते हैं?",
@@ -307,7 +318,13 @@ class BaseMayaAgent(Agent):
             if produced:
                 return
             log.warning("LLM returned an empty reply (attempt %d)", attempt + 1)
-        yield EMPTY_REPLY_FALLBACK.get(self.code, EMPTY_REPLY_FALLBACK["en"])
+        last = chat_ctx.items[-1] if chat_ctx.items else None
+        if getattr(last, "type", None) == "function_call_output":
+            phone_tool = getattr(last, "name", "") in ("capture_lead", "book_consultation")
+            table = TOOL_REPLY_FALLBACK if phone_tool else GENERIC_TOOL_FALLBACK
+        else:
+            table = EMPTY_REPLY_FALLBACK
+        yield table.get(self.code, table["en"])
 
     async def tts_node(self, text, model_settings):
         """Strip markdown (bullets, **bold**, #) the LLM sometimes emits, so the

@@ -43,6 +43,12 @@ QUALIFY = (
     "Never repeat a question already answered; if they decline, stay friendly and keep helping."
 )
 
+PHONE_RULE = (
+    "PHONE: Ask for the full ten-digit number in one go. If you hear only part of it, just say "
+    "\"Go on\" and wait for the rest; never fill in, guess or pad missing digits. "
+    "Call the tool only once you have all ten digits."
+)
+
 # Human-readable language names, used in the per-language instruction line.
 LANG_NAMES: dict[str, str] = {
     "en": "English",
@@ -114,6 +120,7 @@ def build_instructions(
         "message (English or Hindi), without mentioning it. Call set_language only if the caller asks for a language.\n"
         "After any tool returns, always reply to the caller.\n"
         f"{QUALIFY.format(business=business)}\n"
+        f"{PHONE_RULE}\n"
         f"{CONVERSATION_ENDING}"
     )
     grammar = load_grammar(language) if include_grammar else ""

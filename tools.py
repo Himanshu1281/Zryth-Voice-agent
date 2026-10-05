@@ -69,7 +69,8 @@ _GOODBYES = {
 _GOODBYE = re.compile(
     r"\b(?:bye|goodbye|good night|that's all|thats all|that is all|no thanks?|nothing else|"
     r"not now|that's it|thats it|i'm done|im done|hang up|cut the call|done|thank you|thanks|"
-    r"ok bye|chalo|rakhta|rakhti)\b|धन्यवाद|शुक्रिया|बाय|बस इतना|और कुछ नहीं|रखता|रखती",
+    r"ok bye|okay bye|chalo|rakhta|rakhti|take care|see you|see ya|alright|all right|"
+    r"have a (?:good|nice|great) day)\b|धन्यवाद|शुक्रिया|बाय|बस इतना|और कुछ नहीं|रखता|रखती",
     re.I,
 )
 
@@ -393,6 +394,8 @@ class AppointmentTools:
         self.caller_phone: str | None = None
         # (name, phone) already saved this call -- stops duplicate bookings.
         self.saved_contact: tuple[str, str] | None = None
+        # A spoken number waiting for the caller's "yes" after Maya reads it back.
+        self.pending_phone: str | None = None
         # end_call defers once to offer a callback when no details were saved.
         self.callback_offered = False
 
@@ -462,6 +465,21 @@ class AppointmentTools:
                 "message": f"Nothing saved: the caller never gave that number. {offer}",
             }
 
+        # Spoken numbers are often misheard or split across turns ("8221" ... "5216"),
+        # so read a new one back and save only when the LLM calls again after a "yes".
+        # The caller ID needs no read-back: the caller just agreed to "this same number".
+        if clean != caller and self.pending_phone != clean:
+            self.pending_phone = clean
+            return {
+                "status": "confirm_first",
+                "message": (
+                    f"Not saved yet. Read the number back digit by digit ({_spoken_digits(clean)}) "
+                    "and ask if it is correct. Call this tool again with the same number only after "
+                    "the caller says yes; if they correct it, ask for the full ten-digit number again."
+                ),
+            }
+        self.pending_phone = None
+
         name = name.strip()
         if self.saved_contact == (name, clean):
             return {
@@ -487,6 +505,16 @@ class AppointmentTools:
                 "message": f"Updated to {name}, {_spoken_digits(clean)}. Briefly confirm the change.",
             }
         what = "consultation request" if tool == "book_consultation" else "details"
+        if clean != caller:
+            # The caller already confirmed this number on the read-back.
+            return {
+                "status": "saved",
+                "message": (
+                    f"Saved. In one short reply tell {name} their {what} is recorded and the "
+                    f"{self.config.business_name} team will contact them on that number. "
+                    "Don't read the number again."
+                ),
+            }
         return {
             "status": "saved",
             "message": (
