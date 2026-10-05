@@ -26,7 +26,7 @@ log = logging.getLogger("knowledge-ingest")
 
 BUCKET = "knowledge_base"
 EMBED_MODEL = "gemini-embedding-2"
-CHUNKER_VERSION = "sentence-v1"
+CHUNKER_VERSION = "sentence-v2"  # v2: no "[Document title]" prefix in chunk text
 SUPPORTED_EXT = (".pdf", ".txt")
 _AGENT_FOLDER = re.compile(r"^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/")
 
@@ -57,7 +57,7 @@ def build_rows(filename: str, agent_id: str | None = None) -> list[dict]:
     if "[FILL IN" in text:
         # Never let template placeholders reach callers.
         raise ValueError(f"{filename} still contains [FILL IN] placeholders")
-    chunks = chunk_text(text, title=title_from_filename(filename.rsplit("/", 1)[-1]))
+    chunks = chunk_text(text)
     return [
         {
             "content": c,

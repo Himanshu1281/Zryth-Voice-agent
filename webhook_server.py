@@ -147,18 +147,6 @@ async def knowledge_delete(
 class SummarizeRequest(BaseModel):
     transcript: str
 
-SUMMARY_PROMPT = """You are an expert conversation analyst. Read the following customer service transcript and write a concise, professional summary paragraph (3-5 sentences).
-
-Make sure to include:
-1. The customer's specific questions or requests.
-2. Any exact product names, features, or details the agent provided.
-3. The final outcome of the call.
-
-Write it as a fluid paragraph, without bullet points or markdown.
-
-Transcript:
-"""
-
 
 @app.post("/internal/ai/summarize")
 async def summarize_call(
