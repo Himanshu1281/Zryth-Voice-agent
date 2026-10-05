@@ -7,6 +7,12 @@ from pydantic import BaseModel
 import urllib.request
 import json
 
+from dotenv import load_dotenv
+
+# Read .env before WEBHOOK_SECRET below; without this the secret is only seen when
+# the process manager exports it, and every /internal call fails with 500.
+load_dotenv()
+
 logging.basicConfig(level=logging.INFO)
 
 log = logging.getLogger("knowledge-webhook")

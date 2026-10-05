@@ -683,7 +683,9 @@ async def entrypoint(ctx: JobContext) -> None:
         ctx.shutdown(reason="call ended by agent")
 
     async def _hang_up_fallback() -> None:
-        await asyncio.sleep(12)
+        # Backstop only: normally we hang up the moment the goodbye finishes.
+        # The fixed goodbye is ~4-4.5 s of audio (+ TTS start), so 7 s never cuts it off.
+        await asyncio.sleep(7)
         await _hang_up()
 
     def on_agent_state_changed(ev) -> None:

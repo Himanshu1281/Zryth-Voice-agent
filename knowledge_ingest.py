@@ -14,13 +14,12 @@ from __future__ import annotations
 
 import io
 import logging
+import re
 import sys
 import time
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent / "scripts"))
-
-from chunking import chunk_text, title_from_filename  # noqa: E402
+from scripts.chunking import chunk_text, title_from_filename  # noqa: E402
 from database import _init_supabase, fetch_all  # noqa: E402
 
 log = logging.getLogger("knowledge-ingest")
@@ -29,6 +28,13 @@ BUCKET = "knowledge_base"
 EMBED_MODEL = "gemini-embedding-2"
 CHUNKER_VERSION = "sentence-v1"
 SUPPORTED_EXT = (".pdf", ".txt")
+_AGENT_FOLDER = re.compile(r"^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/")
+
+
+def agent_from_path(filename: str) -> str | None:
+    """The agent a bucket object belongs to: files live under "<agent_id>/"."""
+    m = _AGENT_FOLDER.match(filename or "")
+    return m.group(1) if m else None
 
 
 def _extract_text(filename: str, data: bytes) -> str:
@@ -98,7 +104,8 @@ def _embed(rows: list[dict]) -> None:
 
 def ingest_source(filename: str, agent_id: str | None = None) -> int:
     """(Re)ingest one source file into one agent's KB, replacing its existing rows.
-    Returns the new row count."""
+    Returns the new row count. The agent defaults to the file's "<agent_id>/" folder."""
+    agent_id = agent_id or agent_from_path(filename)
     sb = _init_supabase()
     rows = build_rows(filename, agent_id)
     if not rows:
@@ -145,13 +152,36 @@ def heal_legacy_chunks() -> list[str]:
             log.warning("Legacy rows for %s but file type unsupported; skipping", src)
             continue
         try:
-            # keep the rows in the knowledge base they already belonged to
-            owner = (
-                _init_supabase().table("zryth_knowledge").select("agent_id")
-                .eq("metadata->>source", src).limit(1).execute().data
-            )
-            ingest_source(src, (owner[0].get("agent_id") if owner else None))
+            # The file's folder decides the agent; rows written elsewhere may lack agent_id
+            agent_id = agent_from_path(src)
+            if not agent_id:
+                owner = (
+                    _init_supabase().table("zryth_knowledge").select("agent_id")
+                    .eq("metadata->>source", src).limit(1).execute().data
+                )
+                agent_id = owner[0].get("agent_id") if owner else None
+            ingest_source(src, agent_id)
             fixed.append(src)
         except Exception:
             log.exception("Auto re-chunk failed for %s (rows left as they were)", src)
+    # Uploads whose ingest never ran (agent unreachable at upload time)
+    for src in missing_sources():
+        try:
+            ingest_source(src)
+            fixed.append(src)
+        except Exception:
+            log.exception("Ingest of un-ingested upload %s failed", src)
     return fixed
+
+
+def missing_sources() -> list[str]:
+    """Bucket files (root and agent folders) that have no rows in zryth_knowledge."""
+    bucket = _init_supabase().storage.from_(BUCKET)
+    known = {(r.get("metadata") or {}).get("source") for r in fetch_all("zryth_knowledge", "id, metadata")}
+    files: list[str] = []
+    for entry in bucket.list("", {"limit": 1000}):
+        if entry.get("id") is None:  # a folder
+            files += [f"{entry['name']}/{f['name']}" for f in bucket.list(entry["name"], {"limit": 1000}) if f.get("id")]
+        else:
+            files.append(entry["name"])
+    return sorted(f for f in files if f.lower().endswith(SUPPORTED_EXT) and f not in known)
