@@ -14,6 +14,7 @@ from google import genai
 from livekit.agents import JobContext, RunContext, function_tool
 from livekit.agents.beta.workflows import WarmTransferTask
 
+from contact_flow import _BOOKING_WORDS, _CALLBACK_WORDS, _OFFER, ContactFlow, clean_phone
 from routing import DEFAULT_CONFIG, CallConfig
 from database import log_knowledge_gap, update_call_lead
 from dynamic_executor import execute_tool_call, is_executable
@@ -56,7 +57,21 @@ _NAME_ALIASES = [
 
 # A bare "no" answering "anything else?" also means the caller is done.
 _SHORT_NO = re.compile(
-    r"^\W*(?:no|nope|nah|no no|nothing|not really|nahi|nahin|नहीं|ना|जी नहीं)\W*$", re.I
+    r"^\W*(?:no|nope|nah|no no|nothing|not really|nahi|nahin|नहीं|ना|जी नहीं|नहीं जी|कुछ नहीं|"
+    r"नहीं धन्यवाद|no thank you|no that's it|बस|बस इतना ही)\W*$", re.I
+)
+
+# Maya's reply already sounds like a goodbye ("आपका दिन शुभ हो!", "have a great day").
+_SIGNOFF = re.compile(
+    r"goodbye|\bbye\b|have a (?:good|nice|great) day|team will (?:contact|call)|"
+    r"anything else|शुभ हो|नमस्ते|अलविदा|संपर्क करेगी|कॉल करेगी|और किसी|और कुछ",
+    re.I,
+)
+# Short acknowledgements that, after a sign-off, mean "okay, bye".
+_ACK = re.compile(
+    r"^\W*(?:ok|okay|ok ok|alright|sure|fine|great|yes|ji|ठीक है|ठीक|अच्छा|ओके|हाँ|जी)"
+    r"(?:\s+(?:hai|bhai|ji|sir|madam|भाई|जी|सर|मैडम|है))*\W*$",
+    re.I,
 )
 
 # Spoken by end_call itself, so every call ends the same polite way.
@@ -66,13 +81,41 @@ _GOODBYES = {
 }
 
 # Caller is wrapping up: only then may end_call actually hang up.
-_GOODBYE = re.compile(
+_GOODBYE_STRONG = re.compile(
     r"\b(?:bye|goodbye|good night|that's all|thats all|that is all|no thanks?|nothing else|"
-    r"not now|that's it|thats it|i'm done|im done|hang up|cut the call|done|thank you|thanks|"
-    r"ok bye|okay bye|chalo|rakhta|rakhti|take care|see you|see ya|alright|all right|"
-    r"have a (?:good|nice|great) day)\b|धन्यवाद|शुक्रिया|बाय|बस इतना|और कुछ नहीं|रखता|रखती",
+    r"not now|that's it|thats it|i'm done|im done|hang up|cut the call|"
+    r"ok bye|okay bye|rakhta|rakhti|take care|see you|see ya|"
+    r"have a (?:good|nice|great) day)\b|बाय|बस इतना|और कुछ नहीं|रखता|रखती",
     re.I,
 )
+# Polite words that are just as often mid-conversation ("Thanks! And do you build
+# apps?", "Alright, tell me more"): a goodbye only when nothing else is asked.
+_GOODBYE_SOFT = re.compile(
+    r"\b(?:thank you|thanks|thank u|done|chalo|alright|all right|ok then|okay then)\b|धन्यवाद|शुक्रिया|चलो",
+    re.I,
+)
+_STILL_TALKING = re.compile(
+    r"\?|\b(?:and|but|also|what|which|how|why|when|where|who|can|could|do|does|tell|more|"
+    r"explain|about|need|want|please)\b|और|लेकिन|क्या|कैसे|कब|कहाँ|कौन|बताइए|बताओ|बता|चाहिए|मुझे",
+    re.I,
+)
+
+
+class _Goodbye:
+    """`_GOODBYE.search(text)`: True when the caller's words mean they're done."""
+
+    @staticmethod
+    def search(text: str) -> bool:
+        if _GOODBYE_STRONG.search(text):
+            return True
+        if not _GOODBYE_SOFT.search(text):
+            return False
+        # "Thanks", "Okay thank you", "धन्यवाद जी": short and nothing more asked.
+        rest = _GOODBYE_SOFT.sub(" ", text)
+        return len(text.split()) <= 5 and not _STILL_TALKING.search(rest)
+
+
+_GOODBYE = _Goodbye()
 
 
 _PRICING_Q = re.compile(
@@ -132,7 +175,7 @@ def _vector_search(emb: list[float], agent_id: str | None = None) -> list[dict]:
 # That removes the ~600 ms Gemini embedding call from every turn (measured:
 # Gemini TTFT 1.0 s full-KB vs 1.6 s embed+search+LLM). Beyond this size we
 # switch to per-turn vector retrieval automatically.
-KB_FULL_MAX_CHARS = int(os.getenv("KB_FULL_MAX_CHARS", "1500"))
+KB_FULL_MAX_CHARS = int(os.getenv("KB_FULL_MAX_CHARS", "12000"))
 
 
 def load_full_kb(agent_id: str | None = None) -> str | None:
@@ -267,6 +310,15 @@ def _with_preferred_slot(
     return f"{requirement} (Preferred: {slot})" if requirement else f"Preferred: {slot}"
 
 
+# Custom tools slower than this get a spoken filler while the caller waits.
+_TOOL_FILLER_DELAY_S = 1.0
+# Instruction (not a script), so the LLM says it in the caller's language.
+_TOOL_FAILED = (
+    "The lookup failed. In the caller's language, briefly say you couldn't get that information "
+    "right now, offer to have the team follow up, and continue the conversation."
+)
+
+
 def build_dynamic_tools(tool_specs: list[dict]) -> list:
     """Convert Supabase JSON tool specs into LiveKit tools using the dynamic executor."""
     dynamic_tools = []
@@ -285,9 +337,22 @@ def build_dynamic_tools(tool_specs: list[dict]) -> list:
 
         def make_wrapper(name, spec, instr):
             async def _dynamic_wrapper(context: RunContext, raw_arguments: dict) -> str:
-                return await asyncio.to_thread(
-                    execute_tool_call, name, spec, instr, raw_arguments
+                # External APIs can take seconds: say "let me check" instead of dead air
+                agent = getattr(context.session, "current_agent", None)
+                filler = (
+                    asyncio.create_task(agent._filler_after(_TOOL_FILLER_DELAY_S))
+                    if hasattr(agent, "_filler_after") else None
                 )
+                try:
+                    return await asyncio.to_thread(
+                        execute_tool_call, name, spec, instr, raw_arguments
+                    )
+                except Exception:
+                    log.exception("Dynamic tool %s failed", name)
+                    return _TOOL_FAILED
+                finally:
+                    if filler:
+                        filler.cancel()
             return _dynamic_wrapper
             
         wrapper_func = make_wrapper(tool_name, json_spec, instruction)
@@ -307,68 +372,12 @@ def build_dynamic_tools(tool_specs: list[dict]) -> list:
 
 
 def _clean_phone(phone: str | None) -> str | None:
-    """Return a valid ten-digit Indian mobile number, or None.
+    """Valid ten-digit Indian mobile number, or None (see contact_flow.clean_phone)."""
+    return clean_phone(phone)
 
-    Accepts spaces, dashes, brackets and a +91 / 91 / 0 prefix
-    ("+91 98765-43210" -> "9876543210"). Must start with 6-9.
-    """
-    digits = re.sub(r"\D", "", phone or "")
-    if len(digits) == 12 and digits.startswith("91"):
-        digits = digits[2:]
-    elif len(digits) == 11 and digits.startswith("0"):
-        digits = digits[1:]
-    return digits if re.fullmatch(r"[6-9]\d{9}", digits) else None
-
-
-_BAD_PHONE_MSG = (
-    "That phone number is not a valid ten-digit mobile number. Read back what you heard "
-    "and ask the caller to repeat their ten-digit number. Do not save until it is valid."
-)
 
 # Values the LLM invents when it calls a tool before the caller has said anything.
 _PLACEHOLDERS = {"", "user", "caller", "customer", "unknown", "none", "null", "n/a", "na", "name", "phone"}
-
-
-def _missing_details(name: str | None, phone: str | None) -> dict | None:
-    """Failure result when name/phone were never actually given, else None.
-
-    Keeps Maya from telling the caller their number is invalid when they
-    haven't given one yet (the LLM fills placeholders like "User").
-    """
-    missing = []
-    if (name or "").strip().lower() in _PLACEHOLDERS:
-        missing.append("name")
-    if not re.search(r"\d", phone or ""):
-        missing.append("phone number")
-    if not missing:
-        return None
-    return {
-        "status": "failed",
-        "message": (
-            f"Nothing was saved: the caller has not given their {' or '.join(missing)} yet. "
-            "Do NOT say anything was invalid or that they provided it. Politely ask for the "
-            f"{missing[0]} now (one question only), then call this tool again."
-        ),
-    }
-
-
-def _spoken_digits(phone: str) -> str:
-    """'8591194506' -> '8 5 9 1 1 9 4 5 0 6' so Maya reads it digit by digit."""
-    return " ".join(phone)
-
-
-def _user_said_digits(context: RunContext, digits: str) -> bool:
-    """True when the caller's own transcripts contain this number."""
-    try:
-        said = "".join(
-            re.sub(r"\D", "", m.text_content or "")
-            for m in context.session.history.items
-            if getattr(m, "role", None) == "user"
-        )
-    except Exception:
-        log.exception("could not read history for phone check")
-        return True  # don't block saving on an SDK change
-    return digits in said
 
 
 def _user_texts(context: RunContext) -> list[str]:
@@ -393,7 +402,9 @@ def _user_said_name(context: RunContext, name: str) -> bool:
     texts = _user_texts(context)
     if not texts:
         return True  # history unreadable: don't block saving
-    words = [w.lower() for w in re.findall(r"\w+", name) if len(w) > 1]
+    # Split on spaces, not \w: Devanagari vowel signs aren't \w, so r"\w+" breaks
+    # "योगेश" into single letters and the name never matches.
+    words = [w.lower() for w in re.sub(r"[^\w\sऀ-ॿ]", " ", name).split() if len(w) > 1]
     if not words:
         return False
     for t in texts:
@@ -419,17 +430,59 @@ def _last_reply_asked(context: RunContext, pattern: str) -> bool:
     return False
 
 
-def _last_reply_asked_number(context: RunContext) -> bool:
-    """Maya's last reply asked about / read back a number, and the caller answered."""
-    return _last_reply_asked(context, r"number|नंबर|नम्बर|\d")
-
-
-# An instruction, not a script: verbatim English text got read out to Hindi callers.
-_TRANSFER_FAILED = (
-    "Transfer failed: no team member could be reached. In the caller's language (the one they "
-    "are speaking now), say sorry that nobody is free right now, that the {business} team will "
-    "call them back, and offer to keep helping."
+# Caller asked to be contacted / gave contact intent in their own words.
+_CONTACT_WORDS = re.compile(
+    r"\b(?:call me|callback|call back|contact me|reach me|my number|interested|sign me up)\b"
+    r"|कॉल कर|कॉल बैक|संपर्क कर|बात करवा|मेरा नंबर|interested",
+    re.I,
 )
+
+
+def _labelled(tool: str, requirement: Optional[str]) -> str:
+    """The calls row has one requirement field for both tools: tag which one it was
+    so the team can tell a callback request from a consultation booking."""
+    label = "[Consultation request]" if tool == "book_consultation" else "[Callback request]"
+    return f"{label} {requirement}" if requirement else label
+
+
+def _wants_contact(context: RunContext) -> bool:
+    """The caller asked for a callback/demo/consultation, or answered Maya's offer of
+    one, in the last few turns ("I'm interested" can come a turn before "yes").
+    Anything else and the contact flow shouldn't start."""
+    try:
+        items = [m for m in context.session.history.items
+                 if getattr(m, "role", None) in ("user", "assistant") and m.text_content]
+    except Exception:
+        return True  # can't tell: don't block a real request
+    recent = items[-6:]
+    users = [m.text_content for m in recent if m.role == "user"]
+    replies = [m.text_content for m in recent if m.role == "assistant"]
+    return any(
+        _BOOKING_WORDS.search(t) or _CALLBACK_WORDS.search(t) or _CONTACT_WORDS.search(t) for t in users
+    ) or any(_OFFER.search(t) for t in replies)
+
+
+def _user_turns(context: RunContext) -> int:
+    """How many caller messages the session has (to tell whether they spoke since)."""
+    try:
+        return sum(1 for m in context.session.history.items if getattr(m, "role", None) == "user")
+    except Exception:
+        return -1
+
+
+# end_call's one-time offer before hanging up on a caller whose details weren't
+# saved. A "yes" starts the contact flow (it matches contact_flow._OFFER).
+_CALLBACK_OFFER = {
+    "en": "Before you go, should our team call you back with more details?",
+    "hi": "जाने से पहले, क्या हमारी टीम आपको ज़्यादा जानकारी के लिए वापस कॉल करे?",
+}
+
+# Spoken by transfer_to_human itself when the transfer fails; ends with a callback
+# offer, so a "yes" starts the contact flow.
+_TRANSFER_FAILED_LINES = {
+    "en": "Sorry, nobody from the team is free right now. Should our team call you back?",
+    "hi": "माफ़ कीजिए, अभी टीम में कोई उपलब्ध नहीं है। क्या हमारी टीम आपको वापस कॉल करे?",
+}
 
 
 class AppointmentTools:
@@ -455,10 +508,12 @@ class AppointmentTools:
         self.caller_phone: str | None = None
         # (name, phone) already saved this call -- stops duplicate bookings.
         self.saved_contact: tuple[str, str] | None = None
-        # A spoken number waiting for the caller's "yes" after Maya reads it back.
-        self.pending_phone: str | None = None
+        # Name + phone collection, driven turn by turn from agent.on_user_turn_completed.
+        self.contact = ContactFlow()
         # end_call defers once to offer a callback when no details were saved.
         self.callback_offered = False
+        # time.monotonic() of the caller's last "hold on" (silence check waits longer).
+        self.hold_requested_at: float | None = None
 
     async def prepare_kb(self) -> None:
         """Load the KB once per call (local disk, a few ms)."""
@@ -469,145 +524,88 @@ class AppointmentTools:
         )
 
     def to_tools(self) -> list:
-        return [
-            self.capture_lead,
-            self.book_consultation,
-            self.transfer_to_human,
-            self.end_call,
-        ]
+        tools = [self.capture_lead, self.book_consultation, self.end_call]
+        # Live transfer is off until the SIP outbound trunk / transfer number work:
+        # every attempt failed and left Maya stuck in LiveKit's transfer mode. A
+        # request for a human now starts a callback instead (agent._maybe_start_contact).
+        # Set ENABLE_HUMAN_TRANSFER=1 to turn it back on.
+        if os.getenv("ENABLE_HUMAN_TRANSFER", "").strip().lower() in ("1", "true", "yes"):
+            tools.insert(2, self.transfer_to_human)
+        return tools
 
     @function_tool
     async def capture_lead(
         self,
         context: RunContext,
-        name: str,
-        phone: str,
         requirement: Optional[str] = None,
-    ) -> dict:
-        """Save an interested caller's name and phone number.
+        name: Optional[str] = None,
+    ) -> None:
+        """Start taking the caller's contact details so the team can call them back.
 
-        Use when the caller shows interest but has NOT asked to book a meeting
-        (for a date/time or "book a call", use `book_consultation`).
-        Ask the caller ONLY for their name and ten-digit phone number. Never ask
-        for email, company, or anything else.
+        Use when the caller shows interest or agrees to a callback but has NOT asked
+        to book a meeting (for a meeting, demo or consultation use `book_consultation`).
+        Do NOT ask for their name or number yourself: this tool asks for the name,
+        the phone number and confirms it, then saves everything. Say nothing after
+        calling it.
 
         Args:
-            name: Caller's name.
-            phone: Caller's ten-digit mobile number.
             requirement: What they want, summarised by you from the conversation
                 (do NOT ask the caller for this).
+            name: The caller's own name ONLY if they already told you it; never a
+                company or institute name.
         """
 
-        return await self._save_contact(context, "capture_lead", name, phone, requirement)
+        await self._start_contact(context, "capture_lead", name, requirement)
 
-    async def _save_contact(
-        self, context: RunContext, tool: str, name: str, phone: str, requirement: Optional[str]
-    ) -> dict:
-        """Shared by capture_lead/book_consultation: validate, de-duplicate, save,
-        then have Maya confirm the name and read the number back."""
-        missing = _missing_details(name, phone)
-        if missing:
-            return missing
-        # The LLM sometimes lifts a "name" from a sentence ("founder social media")
-        # without ever asking for it.
-        if not _user_said_name(context, name):
-            log.warning("%s: rejected name %r not given by caller", tool, name)
-            return {
-                "status": "failed",
-                "message": (
-                    "Nothing saved: the caller has not told you their name. Politely ask for their "
-                    "name now (one question only), then call this tool again."
-                ),
-            }
-        clean = _clean_phone(phone)
-        if not clean:
-            return {"status": "failed", "message": _BAD_PHONE_MSG}
-        # The LLM sometimes invents a number (e.g. the 9876543210 example). Accept
-        # only the caller ID or digits the caller actually said. Don't reveal the
-        # caller ID here, or the LLM just resubmits it without asking.
+    async def _start_contact(
+        self, context: RunContext, tool: str, name: Optional[str], requirement: Optional[str]
+    ) -> None:
+        """Shared by capture_lead/book_consultation: hand the conversation to the
+        contact flow, which speaks every question itself (see contact_flow.py)."""
+        lang = getattr(context.session.current_agent, "code", "en")
         caller = _clean_phone(self.caller_phone)
-        if clean != caller and not _user_said_digits(context, clean):
-            log.warning("%s: rejected number %s not said by caller", tool, clean)
-            offer = (
-                "Ask whether the team should call them on the number they're calling from, "
-                "or on another number, and wait for their answer."
-                if caller else "Ask the caller for their ten-digit mobile number."
+        if self.saved_contact is not None:
+            log.info("%s: details already saved this call", tool)
+            return None
+        if self.contact.active:
+            # The LLM called again mid-flow: just repeat the pending question.
+            context.session.say(self.contact.question(lang, caller))
+            return None
+        if not _wants_contact(context):
+            # e.g. "yes" to "what kind of business do you have?" made Gemini call
+            # capture_lead and start asking for a name out of nowhere.
+            log.info("%s: refused, caller hasn't asked for a callback/demo", tool)
+            return (
+                "Not started: the caller hasn't asked for a callback, demo or consultation. "
+                "Don't ask for their name or number; just keep the conversation going."
             )
-            return {
-                "status": "failed",
-                "message": f"Nothing saved: the caller never gave that number. {offer}",
-            }
+        name = (name or "").strip()
+        if name.lower() in _PLACEHOLDERS or not _user_said_name(context, name):
+            name = None
+        log.info("%s: contact flow started (name known=%s, caller id=%s)", tool, bool(name), bool(caller))
+        context.session.say(self.contact.start(tool, requirement, name, lang, caller))
+        return None
 
-        # The caller ID is used only after Maya asked about the number and the
-        # caller answered (not just because the LLM decided to use it).
-        if clean == caller and not _last_reply_asked_number(context):
-            log.warning("%s: caller ID used without asking the caller", tool)
-            return {
-                "status": "confirm_first",
-                "message": (
-                    "Not saved yet. First ask the caller whether the team should reach them on the "
-                    "number they're calling from, or another one. Call this tool again only after they answer."
-                ),
-            }
-
-        # Spoken numbers are often misheard or split across turns ("8221" ... "5216"),
-        # so read a new one back and save only when the LLM calls again after a "yes".
-        if clean != caller and (self.pending_phone != clean or not _last_reply_asked_number(context)):
-            self.pending_phone = clean
-            return {
-                "status": "confirm_first",
-                "message": (
-                    f"Not saved yet. Read the number back digit by digit ({_spoken_digits(clean)}) "
-                    "and ask if it is correct. Call this tool again with the same number only after "
-                    "the caller says yes; if they correct it, ask for the full ten-digit number again."
-                ),
-            }
-        self.pending_phone = None
-
-        name = name.strip()
-        if self.saved_contact == (name, clean):
-            return {
-                "status": "already_saved",
-                "message": "This is already recorded. Do not mention it again; just reply to the caller.",
-            }
-        updating = self.saved_contact is not None
-
+    async def finish_contact(self, lang: str) -> str:
+        """Save the confirmed name + number; returns the line to speak."""
+        flow = self.contact
+        name, phone = flow.name or "", flow.phone or ""
         if self.call_id:
-            await asyncio.to_thread(
-                update_call_lead,
-                call_id=self.call_id,
-                customer_name=name,
-                phone=clean,
-                requirement=requirement,
-            )
-        self.saved_contact = (name, clean)
-        log.info("%s -> %s", tool, name)
-
-        if updating:
-            return {
-                "status": "updated",
-                "message": f"Updated to {name}, {_spoken_digits(clean)}. Briefly confirm the change.",
-            }
-        what = "consultation request" if tool == "book_consultation" else "details"
-        if clean != caller:
-            # The caller already confirmed this number on the read-back.
-            return {
-                "status": "saved",
-                "message": (
-                    f"Saved. In one short reply tell {name} their {what} is recorded and the "
-                    f"{self.config.business_name} team will contact them on that number. "
-                    "Don't read the number again."
-                ),
-            }
-        return {
-            "status": "saved",
-            "message": (
-                f"Saved. In one reply: tell {name} their {what} is recorded and the "
-                f"{self.config.business_name} team will contact them, read the number back digit by digit "
-                f"({_spoken_digits(clean)}), and ask if they'd prefer a different number. "
-                "If they give another number, call this tool again with it."
-            ),
-        }
+            try:
+                await asyncio.to_thread(
+                    update_call_lead,
+                    call_id=self.call_id,
+                    customer_name=name,
+                    phone=phone,
+                    requirement=_labelled(flow.tool, flow.requirement),
+                )
+            except Exception:
+                log.exception("Saving contact details failed")
+        self.saved_contact = (name, phone)
+        log.info("%s -> %s saved", flow.tool, name)
+        text = flow.saved_text(lang, self.config.business_name)
+        flow.reset()
+        return text
 
     async def _log_gap(self, query: str) -> None:
         """Fire-and-forget: record an unanswered question so the KB can be extended."""
@@ -653,30 +651,32 @@ class AppointmentTools:
     async def book_consultation(
         self,
         context: RunContext,
-        name: str,
-        phone: str,
         requirement: Optional[str] = None,
         preferred_date: Optional[str] = None,
         preferred_time: Optional[str] = None,
-    ) -> dict:
-        """Record a consultation request for the team.
+        name: Optional[str] = None,
+    ) -> None:
+        """Book a consultation / demo / meeting with the team.
 
-        Use ONLY when the caller asks to schedule or book a meeting/call, or agrees
-        when you offer one; otherwise use `capture_lead`.
-        Ask the caller ONLY for their name, ten-digit phone number and (optionally)
-        a preferred date/time. Never ask for email, company, or anything else.
+        Call it IMMEDIATELY when the caller asks for a meeting, call or demo, or
+        agrees when you offer one ("yes", "book it", "demo मिल सकता है?"); otherwise
+        use `capture_lead`. Do NOT first ask for a date, time or name: pass a date
+        or time only if the caller already said one.
+        Do NOT ask for their name or number yourself: this tool asks for the name,
+        the phone number and confirms it, then saves everything. Say nothing after
+        calling it.
 
         Args:
-            name: Caller's name.
-            phone: Caller's ten-digit mobile number.
             requirement: What they want, summarised by you from the conversation
                 (do NOT ask the caller for this).
             preferred_date: Preferred date, if the caller gave one.
             preferred_time: Preferred time, if the caller gave one.
+            name: The caller's own name ONLY if they already told you it; never a
+                company or institute name.
         """
 
-        return await self._save_contact(
-            context, "book_consultation", name, phone,
+        await self._start_contact(
+            context, "book_consultation", name,
             _with_preferred_slot(requirement, preferred_date, preferred_time),
         )
 
@@ -703,7 +703,7 @@ class AppointmentTools:
                 "transfer_to_human unavailable (outbound trunk set=%s, transfer number set=%s)",
                 bool(sip_trunk_id), bool(transfer_to),
             )
-            return _TRANSFER_FAILED.format(business=self.config.business_name)
+            return self._transfer_failed(context)
 
         # Blocks the silence check / hang-up logic while the caller is on hold.
         self.is_transferring = True
@@ -734,8 +734,15 @@ class AppointmentTools:
                 sip_trunk_id,
                 transfer_to,
             )
-            return _TRANSFER_FAILED.format(business=self.config.business_name)
+            return self._transfer_failed(context)
 
+    def _transfer_failed(self, context: RunContext) -> None:
+        """Tell the caller right away, in their language, and offer a callback (a
+        "yes" starts the contact flow). Left to the LLM, the apology came turns later,
+        in English, as the answer to something else."""
+        lang = getattr(context.session.current_agent, "code", "en")
+        context.session.say(_TRANSFER_FAILED_LINES.get(lang, _TRANSFER_FAILED_LINES["en"]))
+        return None
 
     @function_tool
     async def end_call(
@@ -755,7 +762,7 @@ class AppointmentTools:
 
         # The LLM sometimes hangs up on fragments like "Sorry" or "First". Only end
         # when the caller's latest words actually sound like they're done.
-        last_user, spoke_after = "", False
+        last_user, spoke_after, prev_reply = "", False, ""
         try:
             for m in reversed(context.session.history.items):
                 role = getattr(m, "role", None)
@@ -764,9 +771,20 @@ class AppointmentTools:
                 elif role == "user" and m.text_content:
                     last_user = m.text_content
                     break
+            # Maya's reply just before the caller's last words.
+            seen_user = False
+            for m in reversed(context.session.history.items):
+                role = getattr(m, "role", None)
+                if role == "user" and m.text_content:
+                    seen_user = True
+                elif seen_user and role == "assistant" and m.text_content:
+                    prev_reply = m.text_content
+                    break
         except Exception:
             log.exception("end_call: could not read history")
-        if last_user and not (_GOODBYE.search(last_user) or _SHORT_NO.match(last_user)):
+        # "ठीक है भाई" / "okay" right after Maya already said goodbye means the caller is done.
+        acked_goodbye = bool(_SIGNOFF.search(prev_reply)) and bool(_ACK.match(last_user))
+        if last_user and not (_GOODBYE.search(last_user) or _SHORT_NO.match(last_user) or acked_goodbye):
             log.info("end_call refused; caller said %r", last_user)
             if spoke_after:
                 return None  # she already answered; a tool reply would make her speak twice
@@ -775,33 +793,52 @@ class AppointmentTools:
 
         # Lead backstop: one callback offer before hanging up on a caller whose
         # details weren't saved. Asked only once, so nobody gets trapped.
-        if self.saved_contact is None and not self.callback_offered and not self.is_transferring:
+        # Skipped when they just declined Maya's own offer ("book a consultation?" ->
+        # "no thanks, bye"): asking again ignores the answer they just gave.
+        if (self.saved_contact is None and not self.callback_offered and not self.is_transferring
+                and not _OFFER.search(prev_reply)):
             self.callback_offered = True
+            self._offer_turn = _user_turns(context)
             log.info("end_call deferred once for a callback offer")
-            ask = (
-                "should our team call you back on this number with more details?"
-                if _clean_phone(self.caller_phone)
-                else "may I take your number so our team can call you back with more details?"
-            )
-            return (
-                "Don't hang up yet. If you haven't already offered a callback, ask in one short sentence: "
-                f"\"Before you go, {ask}\" If you already offered and they declined, just say a brief "
-                "goodbye and call end_call again."
-            )
-
-        if self.is_ending:
+            # Spoken as a fixed line: as an instruction, the LLM read "Don't hang up
+            # yet." aloud to the caller.
+            lang = getattr(context.session.current_agent, "code", "en")
+            context.session.say(_CALLBACK_OFFER.get(lang, _CALLBACK_OFFER["en"]))
             return None
+
+        # The LLM sometimes asks the callback question AND calls end_call again in the
+        # same breath: wait for the caller's answer first.
+        if self.callback_offered and getattr(self, "_offer_turn", None) == _user_turns(context):
+            log.info("end_call refused: caller hasn't answered the callback offer yet")
+            return None
+        self.say_goodbye(context.session, getattr(context.session.current_agent, "code", "en"))
+        return None
+
+    def say_goodbye(self, session, lang: str) -> None:
+        """Fixed goodbye (like the original agent): predictable, and the hang-up
+        fires once it finishes playing. Used by end_call and by the agent itself."""
+        if self.is_ending:
+            return
         self.is_ending = True
         if self.on_end_requested:
             self.on_end_requested()
-        # Fixed goodbye (like the original agent): predictable, and the hang-up
-        # fires once it finishes playing. None = the LLM adds nothing after it.
-        lang = getattr(context.session.current_agent, "code", "en")
-        context.session.say(
+        session.say(
             _GOODBYES.get(lang, _GOODBYES["en"]).format(business=self.config.business_name),
             allow_interruptions=False,
         )
-        return None
+
+    @staticmethod
+    def caller_is_done(text: str, prev_reply: str) -> bool:
+        """The caller is wrapping up: "no, that's all", "नहीं, बस इतना ही", "bye", or
+        "ठीक है" right after Maya asked "anything else?" / said goodbye. Short replies
+        only, so "thanks, and what about pricing?" doesn't hang up on them."""
+        t = (text or "").strip()
+        if not t or "?" in t or len(t.split()) > 6:
+            return False
+        return bool(
+            _GOODBYE.search(t) or _SHORT_NO.match(t)
+            or (_SIGNOFF.search(prev_reply or "") and (_ACK.match(t) or re.match(r"^\W*(?:no|नहीं|ना)(?=\W|$)", t, re.I)))
+        )
 
 
 if __name__ == "__main__":

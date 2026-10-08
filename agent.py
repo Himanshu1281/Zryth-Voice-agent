@@ -16,6 +16,7 @@ agent switches the reply language and TTS voice to match the caller
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -62,7 +63,7 @@ from livekit.agents import (
 )
 from livekit.agents import NOT_GIVEN
 from livekit.agents.llm import FallbackAdapter
-from livekit.plugins import openai, sarvam, silero
+from livekit.plugins import google, openai, sarvam, silero
 
 from config import (
     AUDIO_SAMPLE_RATE,
@@ -91,6 +92,7 @@ from prompts import (
     build_instructions,
     greeting,
 )
+from contact_flow import NO_TRANSFER, _ACCEPT, _BOOKING_WORDS, _HUMAN, _CALLBACK_WORDS, _NO, _NOT_A_YES, _OFFER, _WANT, _YES, clean_phone as _clean_phone
 from routing import CallConfig, resolve_call_config
 from tools import AppointmentTools, build_dynamic_tools, summarize_transcript
 
@@ -123,6 +125,12 @@ GENERIC_TOOL_FALLBACK: dict[str, str] = {
     "hi": "माफ़ कीजिए, एक पल। क्या आप फिर से बता सकते हैं?",
 }
 
+# Played before hanging up on a number that isn't connected to an agent yet.
+NUMBER_NOT_ACTIVE: dict[str, str] = {
+    "en": "Sorry, this number is not active yet. Please try again later. Thank you for calling.",
+    "hi": "माफ़ कीजिए, यह नंबर अभी चालू नहीं है। कृपया थोड़ी देर बाद फिर से कॉल करें। धन्यवाद।",
+}
+
 EMPTY_REPLY_FALLBACK: dict[str, str] = {
     "en": "Sorry, could you say that once more?",
     "hi": "माफ़ कीजिए, क्या आप एक बार फिर से बता सकते हैं?",
@@ -135,11 +143,22 @@ FILLERS: dict[str, tuple[str, ...]] = {
     "hi": ("एक सेकंड, देखती हूँ।", "जी, बस एक पल।", "ठीक है, देखती हूँ।"),
 }
 FILLER_DELAY_S = 1.2  # lookups (normally ~0.6 s) faster than this get no filler
+# Extra silence allowed after the caller says "hold on" before Maya checks in.
+HOLD_GRACE_S = 40
 
 
 # --- pipeline wiring ---------------------------------------------------------
 def _build_llm():
-    """Gemini only for now. Groq (primary, Gemini fallback) is commented out below."""
+    """Gemini via the native Google plugin, with Gemini's OpenAI-compatible endpoint
+    as a fallback. (The OpenAI-compatible stream sometimes sends a chunk with no
+    `id`, which fails the whole turn: "ChatChunk id Input should be a valid string".)
+    Groq (primary, Gemini fallback) is commented out below."""
+    gemini_native = google.LLM(
+        model=LLM_MODEL,
+        api_key=GOOGLE_API_KEY,
+        temperature=LLM_TEMPERATURE,
+        max_output_tokens=MAX_TOKENS,
+    )
     gemini = openai.LLM(
         model=LLM_MODEL,
         api_key=GOOGLE_API_KEY,
@@ -147,7 +166,8 @@ def _build_llm():
         temperature=LLM_TEMPERATURE,
         max_completion_tokens=MAX_TOKENS,
     )
-    return gemini
+    # attempt_timeout is passed to Google as the request deadline: it must be >= 10 s.
+    return FallbackAdapter([gemini_native, gemini], attempt_timeout=10.0, max_retry_per_llm=0)
     # --- Groq disabled for now: re-enable to make Groq primary, Gemini fallback ---
     # if not GROQ_API_KEY:
     #     return gemini
@@ -224,13 +244,10 @@ def _build_session(
 
 
 def _with_caller(instructions: str, caller_phone: str | None) -> str:
-    """Let Maya offer the number the caller is dialling from."""
-    if not caller_phone:
-        return instructions
-    return (
-        f"{instructions}\n\nCALLER: dialling from {caller_phone}. When you need contact "
-        "details, ask whether the team should use this number; if yes, pass it as `phone`."
-    )
+    """The caller's number is deliberately NOT given to the LLM: it used to pass it
+    (or one from the knowledge base) to the tools unasked. contact_flow reads it
+    back to the caller itself."""
+    return instructions
 
 
 def _compose_instructions(code: str, caller_phone: str | None, kb: "AppointmentTools | None") -> str:
@@ -267,23 +284,78 @@ _LATIN = re.compile(r"[A-Za-z]")
 # Other Indic scripts (Bengali through Malayalam blocks).
 _FOREIGN_SCRIPT = re.compile(r"[ঀ-ൿ]")
 
+# Live transfer to a person (tools.to_tools); off unless ENABLE_HUMAN_TRANSFER=1.
+_TRANSFER_ON = os.getenv("ENABLE_HUMAN_TRANSFER", "").strip().lower() in ("1", "true", "yes")
+
+# Letters of a reply read before deciding its language (see llm_node). ~6 words:
+# enough to get past a leading English product name ("FinanceAuditor.ai एक...").
+_LANG_CHECK_LETTERS = 30
+
+
+def _wrong_language(head: str, code: str) -> bool:
+    """True when the start of a reply is clearly not in the caller's language."""
+    dev, lat = len(_DEVANAGARI.findall(head)), len(_LATIN.findall(head))
+    if code == "hi":
+        return dev == 0  # not a single Hindi letter in the first ~6 words
+    return dev > lat
+
+
+# Tagged onto the caller's latest message on every LLM call (see llm_node).
+_LANGUAGE_REMINDER: dict[str, str] = {
+    "en": "Reply in English only.",
+    "hi": "Reply ONLY in Hindi, in Devanagari script (product names may stay in English). "
+          "Even if the knowledge, the tool output or your earlier replies are in English, your reply must be Hindi.",
+}
+
 # Short transcripts below this STT confidence are treated as noise ("कि आछे?" at 0.18).
 MIN_TRANSCRIPT_CONFIDENCE = 0.3
+# Text in another Indic script below this confidence is noise, above it a real caller.
+_FOREIGN_MIN_CONFIDENCE = 0.5
+
+# Spoken when the caller talks in a language we don't support (never silence).
+UNSUPPORTED_LANGUAGE: dict[str, str] = {
+    "en": "Sorry, I can only help in English or Hindi. Could you tell me in English or Hindi, please?",
+    "hi": "माफ़ कीजिए, मैं सिर्फ़ हिंदी या अंग्रेज़ी में मदद कर सकती हूँ। क्या आप हिंदी या अंग्रेज़ी में बता सकते हैं?",
+}
+
+# Caller asks Maya to wait ("hold on", "ek minute"): the silence check-in waits longer.
+_HOLD = re.compile(
+    r"\b(?:hold on|wait a (?:minute|second|sec|moment)|please wait|one (?:minute|second|sec)|just a (?:minute|second|sec)|give me a (?:minute|second|sec)|"
+    r"let me (?:check|see)|ek (?:minute|min|second|sec)|ruko|rukiye)\b|रुको|रुकिए|एक मिनट|एक सेकंड|देखता हूँ|देखती हूँ",
+    re.I,
+)
+
+# Hindi written in Latin letters ("mujhe price batao"): common function words / verbs
+# that never appear in English sentences.
+_ROMAN_HINDI = re.compile(
+    r"^(?:mujhe|mujhko|mera|meri|mere|hum|humein|hamara|aap|aapka|aapki|aapke|tum|kya|kaise|kaisa|"
+    r"kab|kahan|kyun|kitna|kitne|kitni|hai|hain|tha|thi|ho|hoga|hogi|nahi|nahin|haan|ji|"
+    r"batao|bataiye|bata|chahiye|chahta|chahti|karna|karo|kariye|kar|raha|rahi|rahe|"
+    r"ka|ki|ke|ko|se|mein|par|pe|bhi|toh|aur|lekin|abhi|achha|accha|theek|thik|samjha|samajh|"
+    r"baare|wala|wali|kuch|sab|matlab|bolo|boliye|dijiye|sakte|sakti|sakta)$",
+    re.I,
+)
 
 
 def _detect_language(text: str) -> str | None:
     """'hi' / 'en' from the transcript's script, or None when too short or mixed
     to tell. Sarvam codemix writes Hindi in Devanagari and English in Latin, so
     "Zryth के बारे में बताओ" -> hi and "tell me about your products" -> en."""
-    if len(text.split()) < 2:
+    words = text.split()
+    if len(words) < 2:
         return None  # "ok", "haan" -- not enough to switch on
-    dev, lat = len(_DEVANAGARI.findall(text)), len(_LATIN.findall(text))
-    if dev + lat < 4:
-        return None
-    ratio = dev / (dev + lat)
-    if ratio >= 0.5:
+    # Count words, not letters: Hindi callers use many English nouns ("मेरे पास
+    # Instagram पे influencer account है"), which swamped a letter ratio. An English
+    # speaker never produces Devanagari, so two Devanagari words already mean Hindi.
+    dev = sum(1 for w in words if _DEVANAGARI.search(w))
+    lat = sum(1 for w in words if _LATIN.search(w))
+    if dev >= 2 or (dev == 1 and lat <= 1):
         return "hi"
-    if ratio <= 0.15:
+    if dev == 0 and lat >= 2:
+        # Romanized Hindi ("mujhe aapke chatbot ka price batao") is still Hindi
+        roman = sum(1 for w in words if _ROMAN_HINDI.match(re.sub(r"[^\w]", "", w)))
+        if roman >= 2 and roman * 3 >= len(words):
+            return "hi"
         return "en"
     return None
 
@@ -333,15 +405,65 @@ class BaseMayaAgent(Agent):
                     f"{LANG_NAMES[self.code]}; if it was unclear, ask them what they meant."
                 ),
             )
-        for attempt in range(2):
+        # The language rule buried in the long system prompt (followed by the English
+        # KB) was being ignored. A system message doesn't help with Gemini's native
+        # API (all system messages are merged into the instruction block BEFORE the
+        # conversation), so tag the caller's latest message itself: it's always the
+        # last thing the model reads. Only this LLM copy changes, not the transcript.
+        reminder = _LANGUAGE_REMINDER.get(self.code, _LANGUAGE_REMINDER["en"])
+        for i in range(len(chat_ctx.items) - 1, -1, -1):
+            m = chat_ctx.items[i]
+            if getattr(m, "role", None) == "user" and getattr(m, "type", None) == "message":
+                chat_ctx.items[i] = m.model_copy(update={"content": [*m.content, f"\n\n({reminder})"]})
+                break
+        lang_retried = False
+        for attempt in range(3):
             produced = False
-            async for chunk in Agent.default.llm_node(self, chat_ctx, tools, model_settings):
-                if isinstance(chunk, str):
-                    produced = produced or bool(chunk.strip())
-                elif getattr(chunk, "delta", None) is not None:
-                    d = chunk.delta
-                    produced = produced or bool((d.content or "").strip() or d.tool_calls)
-                yield chunk
+            # Hold the first few words back until we know the reply's language:
+            # Gemini sometimes copies an earlier English answer to a Hindi question.
+            pending: list = []
+            head = ""
+            checking = not lang_retried
+            wrong_lang = False
+            async with contextlib.aclosing(
+                Agent.default.llm_node(self, chat_ctx, tools, model_settings)
+            ) as stream:
+                async for chunk in stream:
+                    text, has_tool = "", False
+                    if isinstance(chunk, str):
+                        text = chunk
+                    elif getattr(chunk, "delta", None) is not None:
+                        text = chunk.delta.content or ""
+                        has_tool = bool(chunk.delta.tool_calls)
+                    produced = produced or bool(text.strip() or has_tool)
+                    if not checking or has_tool:
+                        checking = False
+                        for p in pending:
+                            yield p
+                        pending.clear()
+                        yield chunk
+                        continue
+                    pending.append(chunk)
+                    head += text
+                    if len(_LATIN.findall(head)) + len(_DEVANAGARI.findall(head)) >= _LANG_CHECK_LETTERS:
+                        if _wrong_language(head, self.code):
+                            wrong_lang = True
+                            break
+                        checking = False
+                        for p in pending:
+                            yield p
+                        pending.clear()
+            if wrong_lang:
+                lang_retried = True
+                log.warning("LLM replied in the wrong language (%r...); regenerating in %s", head[:40], self.code)
+                chat_ctx = chat_ctx.copy()
+                chat_ctx.add_message(
+                    role="user",
+                    content=f"(Your answer must be in {LANG_NAMES[self.code]}. Answer my last message again in {LANG_NAMES[self.code]}.)",
+                )
+                continue
+            for p in pending:  # short reply that ended before the check
+                yield p
             if produced:
                 return
             log.warning("LLM returned an empty reply (attempt %d)", attempt + 1)
@@ -369,15 +491,34 @@ class BaseMayaAgent(Agent):
     ) -> None:
         """Inject the agent's relevant knowledge so the LLM answers in ONE round trip."""
         text = new_message.text_content or ""
+        if self.kb is not None and _HOLD.search(text):
+            self.kb.hold_requested_at = time.monotonic()  # "hold on": wait longer before checking in
         # Drop near-silent noise ("Hmm", "Oh bro" at ~0.05 confidence) instead of answering it.
         conf = getattr(new_message, "transcript_confidence", None)
-        if conf is not None and conf < MIN_TRANSCRIPT_CONFIDENCE and len(text.split()) <= 3:
+        last_reply = next(
+            (m.text_content or "" for m in reversed(turn_ctx.items)
+             if getattr(m, "role", None) == "assistant" and m.text_content),
+            "",
+        )
+        # Never noise: digits (part of a phone number), yes/no, or any answer to a
+        # question Maya just asked ("haan", "Ravi" on a bad line).
+        expected_answer = (
+            "?" in last_reply[-80:]
+            or (self.kb is not None and self.kb.contact.active)
+            or bool(_YES.search(text) or _NO.search(text))
+        )
+        if (conf is not None and conf < MIN_TRANSCRIPT_CONFIDENCE and len(text.split()) <= 3
+                and not re.search(r"\d", text) and not expected_answer):
             log.info("Ignoring low-confidence transcript %r (%.2f)", text, conf)
             raise agents.StopResponse()
-        # Only English/Hindi are supported: text in another script (Bengali, Tamil...)
-        # is STT misreading noise or a stray word, not something to answer.
+        # Only English/Hindi are supported. Low-confidence text in another script is
+        # STT misreading noise; a clear sentence is a caller who deserves an answer.
         if _FOREIGN_SCRIPT.search(text) and not (_DEVANAGARI.search(text) or _LATIN.search(text)):
-            log.info("Ignoring transcript in an unsupported script %r", text)
+            if conf is not None and conf < _FOREIGN_MIN_CONFIDENCE:
+                log.info("Ignoring transcript in an unsupported script %r (%.2f)", text, conf)
+                raise agents.StopResponse()
+            log.info("Caller spoke an unsupported language: %r", text)
+            self.session.say(UNSUPPORTED_LANGUAGE.get(self.code, UNSUPPORTED_LANGUAGE["en"]))
             raise agents.StopResponse()
         lang = _detect_language(text)
         if lang and lang != self.code:
@@ -387,6 +528,22 @@ class BaseMayaAgent(Agent):
             )
         if self.kb is None:
             return
+        # Collecting name/phone: code handles the turn (contact_flow.py), not the LLM.
+        last_reply = next(
+            (m.text_content or "" for m in reversed(turn_ctx.items)
+             if getattr(m, "role", None) == "assistant" and m.text_content),
+            "",
+        )
+        if self.kb.contact.active:
+            await self._contact_turn(turn_ctx, new_message, text)
+        elif self.kb.saved_contact is not None and self.kb.caller_is_done(text, last_reply):
+            # Details saved and the caller is done ("नहीं, बस इतना ही"): hang up from
+            # code. Gemini sometimes just says "ज़रूर" and never calls end_call.
+            self._keep_user_turn(new_message)
+            self.kb.say_goodbye(self.session, self.code)
+            raise agents.StopResponse()
+        elif self.kb.saved_contact is None:
+            self._maybe_start_contact(turn_ctx, new_message, text)
         if self.kb.full_kb:
             # Whole KB is already in the system prompt: nothing to wait for. Run
             # the vector lookup in the background only to log knowledge gaps.
@@ -423,6 +580,94 @@ class BaseMayaAgent(Agent):
                 ),
             )
 
+    def _keep_user_turn(self, msg: agents.llm.ChatMessage) -> None:
+        """Record the caller's words before a StopResponse. LiveKit drops the user
+        message when on_user_turn_completed raises StopResponse, so without this the
+        name/number turns were missing from the transcript (Supabase + summary), from
+        what the LLM sees afterwards and from end_call's "what did the caller just say".
+        Same calls LiveKit makes itself when it keeps a turn (agent_activity.py)."""
+        self._chat_ctx.items.append(msg)
+        self.session._conversation_item_added(msg)
+
+    def _maybe_start_contact(
+        self, turn_ctx: agents.llm.ChatContext, new_message: agents.llm.ChatMessage, text: str
+    ) -> None:
+        """Start the contact flow from code when the caller clearly wants a
+        demo/consultation/callback, or says yes to Maya's offer of one. Gemini
+        flash-lite often asks "what time suits you?" itself instead of calling
+        book_consultation, which never gets the details saved."""
+        last_reply = next(
+            (m.text_content or "" for m in reversed(turn_ctx.items)
+             if getattr(m, "role", None) == "assistant" and m.text_content),
+            "",
+        )
+        asked = bool(_BOOKING_WORDS.search(text) and _WANT.search(text)) or bool(_CALLBACK_WORDS.search(text))
+        # "Okay thanks, bye" after an offer is a goodbye, not a yes.
+        accepted = (
+            bool(_OFFER.search(last_reply)) and "?" in last_reply
+            and len(text.split()) <= 6 and bool(_YES.search(text) or _ACCEPT.search(text))
+            and not _NO.search(text)
+            and not _NOT_A_YES.search(text)
+        )
+        # Asking for a person while live transfer is off: offer a callback instead.
+        wants_human = bool(_HUMAN.search(text)) and not _TRANSFER_ON
+        if not (asked or accepted or wants_human):
+            return
+        # Demo/consultation -> booking; a callback ("call me back", or yes to "should our
+        # team call you back?") -> lead.
+        if wants_human:
+            booking = False
+        elif _BOOKING_WORDS.search(text):
+            booking = True
+        elif _CALLBACK_WORDS.search(text):
+            booking = False
+        else:
+            booking = bool(_BOOKING_WORDS.search(last_reply))
+        tool = "book_consultation" if booking else "capture_lead"
+        recent = [
+            m.text_content for m in turn_ctx.items
+            if getattr(m, "role", None) == "user" and m.text_content
+        ][-2:] + [text]
+        requirement = " | ".join(recent)[:300] or None
+        if wants_human:
+            requirement = f"Wanted to talk to a person | {requirement}"
+        log.info("%s started from code (asked=%s, accepted offer=%s, human=%s)", tool, asked, accepted, wants_human)
+        line = self.kb.contact.start(
+            tool, requirement, None, self.code, _clean_phone(self.kb.caller_phone), opener=not wants_human
+        )
+        if wants_human:
+            line = NO_TRANSFER.get(self.code, NO_TRANSFER["en"]) + line
+        self._keep_user_turn(new_message)
+        self.session.say(line)
+        raise agents.StopResponse()
+
+    async def _contact_turn(
+        self, turn_ctx: agents.llm.ChatContext, new_message: agents.llm.ChatMessage, text: str
+    ) -> None:
+        """One caller turn while taking name + number. Speaks the flow's line and
+        stops the LLM, or (caller asked something else) lets the LLM answer and re-ask."""
+        kb = self.kb
+        caller = _clean_phone(kb.caller_phone)
+        step = kb.contact.handle(
+            text, self.code, caller, is_question=bool(_QUESTION.search(text)) and not re.search(r"\d", text)
+        )
+        if step.save:
+            line = await kb.finish_contact(self.code)
+        else:
+            line = step.say
+        if line:
+            self._keep_user_turn(new_message)
+            self.session.say(line)
+            raise agents.StopResponse()
+        if step.reprompt:
+            turn_ctx.add_message(
+                role="system",
+                content=(
+                    "You are taking the caller's contact details. Answer what they just said in one short "
+                    f"sentence, then ask exactly this: \"{step.reprompt}\""
+                ),
+            )
+
     async def _filler_after(self, delay: float) -> None:
         """Say a short "let me check" if the knowledge lookup is still running after `delay`."""
         await asyncio.sleep(delay)
@@ -444,14 +689,21 @@ class BaseMayaAgent(Agent):
 
     @function_tool
     async def set_language(self, context: RunContext, language: str):
-        """Switch the reply language when the caller explicitly asks for one.
+        """Switch the reply language ONLY when the caller explicitly asks to speak a
+        language ("speak in Hindi", "Tamil mein baat karo"). Never call it otherwise:
+        replying in the caller's own language already happens automatically.
+        Also call it when they ask for any other language (Tamil, Bengali...), so
+        they get told which languages are available.
 
         Args:
-            language: one of en, hi.
+            language: language code the caller asked for: en, hi, or any other (e.g. ta, bn).
         """
         code = language.strip().lower()
         if code not in SUPPORTED_LANGUAGES:
-            return f"Language '{language}' is not supported. Supported: {', '.join(SUPPORTED_LANGUAGES)}."
+            return (
+                f"'{language}' is not available. Politely tell the caller, in the language they are "
+                "using now, that you can help in English or Hindi only, and ask which they prefer."
+            )
         if code != self.code:
             await self._switch_language(code)
         return {"status": "switched", "language": code}
@@ -539,8 +791,23 @@ async def entrypoint(ctx: JobContext) -> None:
 
     config = await asyncio.to_thread(resolve_call_config, dialed)
     if config.blocked:
-        # One of our numbers, but the customer hasn't connected it to an agent yet
+        # One of our numbers, but the customer hasn't connected it to an agent yet.
+        # Tell the caller instead of cutting the line silently.
         log.warning("Number %s is not connected to an agent; dropping call", config.dialed_number)
+        try:
+            notice = AgentSession(tts=sarvam.TTS(
+                model=SARVAM_TTS_MODEL, target_language_code=BCP47[DEFAULT_LANGUAGE],
+                speaker=SARVAM_TTS_VOICE, pace=1.10,
+            ))
+            await notice.start(agent=Agent(instructions=""), room=ctx.room)
+            await asyncio.wait_for(
+                notice.say(NUMBER_NOT_ACTIVE.get(DEFAULT_LANGUAGE, NUMBER_NOT_ACTIVE["en"]),
+                           allow_interruptions=False),
+                timeout=15,
+            )
+            await notice.aclose()
+        except Exception:
+            log.exception("Could not play the inactive-number message")
         try:
             await ctx.api.room.delete_room(lk_api.DeleteRoomRequest(room=ctx.room.name))
         finally:
@@ -664,10 +931,34 @@ async def entrypoint(ctx: JobContext) -> None:
     _GOODBYE_MARKERS = ("goodbye", "bye", "din shubh", "दिन शुभ", "have a great day")
 
     # Caller went silent: check in once, then end the call on a second timeout.
+    # The count restarts whenever the caller speaks, so every silence gets a check-in.
     _away_prompts = [0]
+    _hold_wait: list[asyncio.Task | None] = [None]
+
+    async def _after_hold() -> None:
+        # Caller asked us to wait: give them HOLD_GRACE_S more before the usual check-in.
+        await asyncio.sleep(HOLD_GRACE_S)
+        if session.user_state == "away":
+            _on_silence()
 
     def on_user_state_changed(ev) -> None:
+        if ev.new_state == "speaking":
+            _away_prompts[0] = 0
+            if _hold_wait[0]:
+                _hold_wait[0].cancel()
+                _hold_wait[0] = None
+            return
         if ev.new_state != "away" or tools_instance.is_ending or tools_instance.is_transferring:
+            return
+        held = tools_instance.hold_requested_at
+        if held is not None and time.monotonic() - held < HOLD_GRACE_S + 30:
+            tools_instance.hold_requested_at = None
+            _hold_wait[0] = asyncio.create_task(_after_hold())
+            return
+        _on_silence()
+
+    def _on_silence() -> None:
+        if tools_instance.is_ending or tools_instance.is_transferring:
             return
         _away_prompts[0] += 1
         # Maya already said goodbye but the LLM skipped end_call: just hang up.

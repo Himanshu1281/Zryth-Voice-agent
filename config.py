@@ -52,8 +52,10 @@ GROQ_MODEL = os.getenv("GROQ_MODEL", "qwen/qwen3.8-27b")
 GROQ_REASONING_EFFORT = os.getenv("GROQ_REASONING_EFFORT", "none")
 LLM_MODEL = os.getenv("LLM_MODEL", "gemini-2.5-flash-lite")
 LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.3"))
-# Hard cap on reply length. Short replies = lower TTS/LLM latency on a phone call.
-MAX_TOKENS = int(os.getenv("MAX_TOKENS", "150"))
+# Safety cap only: the prompt keeps replies to 1-2 sentences. Devanagari costs ~3-4x the
+# tokens of English, so 150 cut Hindi answers mid-sentence. Replies stream, so a higher
+# cap does not add latency.
+MAX_TOKENS = int(os.getenv("MAX_TOKENS", "300"))
 
 
 # --- Agent behaviour ---------------------------------------------------------
