@@ -371,6 +371,67 @@ def _user_said_digits(context: RunContext, digits: str) -> bool:
     return digits in said
 
 
+def _user_texts(context: RunContext) -> list[str]:
+    """Caller transcripts so far, oldest first ([] if the history can't be read)."""
+    try:
+        return [
+            m.text_content for m in context.session.history.items
+            if getattr(m, "role", None) == "user" and m.text_content
+        ]
+    except Exception:
+        log.exception("could not read history")
+        return []
+
+
+_NAME_INTRO = re.compile(r"\bname\b|नाम|\bi am\b|\bi'm\b|\bthis is\b|मैं .* हूँ", re.I)
+
+
+def _user_said_name(context: RunContext, name: str) -> bool:
+    """True when the caller actually gave this name: it appears in a short reply
+    ("Rahul", "मेरा नाम राहुल है") or one that introduces a name ("my name is...").
+    Stops the LLM saving a phrase lifted from a long sentence ("founder social media")."""
+    texts = _user_texts(context)
+    if not texts:
+        return True  # history unreadable: don't block saving
+    words = [w.lower() for w in re.findall(r"\w+", name) if len(w) > 1]
+    if not words:
+        return False
+    for t in texts:
+        low = t.lower()
+        if any(w in low for w in words) and (len(t.split()) <= 6 or _NAME_INTRO.search(t)):
+            return True
+    # The caller answered "what's your name?" but STT wrote it in another script
+    # (राहुल vs Rahul): trust the answer to a direct question.
+    return _last_reply_asked(context, r"name|नाम")
+
+
+def _last_reply_asked(context: RunContext, pattern: str) -> bool:
+    """True when Maya's last reply matches `pattern` AND the caller has answered it."""
+    try:
+        items = [m for m in context.session.history.items if getattr(m, "role", None) in ("user", "assistant")]
+    except Exception:
+        return True
+    for i in range(len(items) - 1, -1, -1):
+        if items[i].role == "assistant" and items[i].text_content:
+            asked = re.search(pattern, items[i].text_content, re.I)
+            answered = any(m.role == "user" for m in items[i + 1:])
+            return bool(asked and answered)
+    return False
+
+
+def _last_reply_asked_number(context: RunContext) -> bool:
+    """Maya's last reply asked about / read back a number, and the caller answered."""
+    return _last_reply_asked(context, r"number|नंबर|नम्बर|\d")
+
+
+# An instruction, not a script: verbatim English text got read out to Hindi callers.
+_TRANSFER_FAILED = (
+    "Transfer failed: no team member could be reached. In the caller's language (the one they "
+    "are speaking now), say sorry that nobody is free right now, that the {business} team will "
+    "call them back, and offer to keep helping."
+)
+
+
 class AppointmentTools:
     """Tools the agent can use during a customer call."""
 
@@ -447,17 +508,29 @@ class AppointmentTools:
         missing = _missing_details(name, phone)
         if missing:
             return missing
+        # The LLM sometimes lifts a "name" from a sentence ("founder social media")
+        # without ever asking for it.
+        if not _user_said_name(context, name):
+            log.warning("%s: rejected name %r not given by caller", tool, name)
+            return {
+                "status": "failed",
+                "message": (
+                    "Nothing saved: the caller has not told you their name. Politely ask for their "
+                    "name now (one question only), then call this tool again."
+                ),
+            }
         clean = _clean_phone(phone)
         if not clean:
             return {"status": "failed", "message": _BAD_PHONE_MSG}
         # The LLM sometimes invents a number (e.g. the 9876543210 example). Accept
-        # only the caller ID or digits the caller actually said.
+        # only the caller ID or digits the caller actually said. Don't reveal the
+        # caller ID here, or the LLM just resubmits it without asking.
         caller = _clean_phone(self.caller_phone)
         if clean != caller and not _user_said_digits(context, clean):
             log.warning("%s: rejected number %s not said by caller", tool, clean)
             offer = (
-                f"Ask whether the team should call them on the number they're calling from "
-                f"({_spoken_digits(caller)}), or on another number."
+                "Ask whether the team should call them on the number they're calling from, "
+                "or on another number, and wait for their answer."
                 if caller else "Ask the caller for their ten-digit mobile number."
             )
             return {
@@ -465,10 +538,21 @@ class AppointmentTools:
                 "message": f"Nothing saved: the caller never gave that number. {offer}",
             }
 
+        # The caller ID is used only after Maya asked about the number and the
+        # caller answered (not just because the LLM decided to use it).
+        if clean == caller and not _last_reply_asked_number(context):
+            log.warning("%s: caller ID used without asking the caller", tool)
+            return {
+                "status": "confirm_first",
+                "message": (
+                    "Not saved yet. First ask the caller whether the team should reach them on the "
+                    "number they're calling from, or another one. Call this tool again only after they answer."
+                ),
+            }
+
         # Spoken numbers are often misheard or split across turns ("8221" ... "5216"),
         # so read a new one back and save only when the LLM calls again after a "yes".
-        # The caller ID needs no read-back: the caller just agreed to "this same number".
-        if clean != caller and self.pending_phone != clean:
+        if clean != caller and (self.pending_phone != clean or not _last_reply_asked_number(context)):
             self.pending_phone = clean
             return {
                 "status": "confirm_first",
@@ -603,8 +687,9 @@ class AppointmentTools:
     ) -> dict:
         """Transfer the caller to a human team member.
 
-        Use when the caller asks to be transferred, to speak with a human or
-        someone from the team, or the request requires human assistance.
+        Use ONLY when the caller explicitly asks to talk to a person, a human, or
+        someone from the team. NEVER use it when they just want an answer
+        ("tell me", "बताइए", "अभी बताएँ"): answer them yourself instead.
         In the same reply, briefly tell the caller you're connecting them now
         and to please hold.
         """
@@ -618,10 +703,7 @@ class AppointmentTools:
                 "transfer_to_human unavailable (outbound trunk set=%s, transfer number set=%s)",
                 bool(sip_trunk_id), bool(transfer_to),
             )
-            return (
-                "I'm sorry, I can't transfer calls right now. "
-                f"The {self.config.business_name} team will call you back directly."
-            )
+            return _TRANSFER_FAILED.format(business=self.config.business_name)
 
         # Blocks the silence check / hang-up logic while the caller is on hold.
         self.is_transferring = True
@@ -652,10 +734,7 @@ class AppointmentTools:
                 sip_trunk_id,
                 transfer_to,
             )
-            return (
-                "I was unable to connect you to a team member right now. "
-                "Please try again in a moment."
-            )
+            return _TRANSFER_FAILED.format(business=self.config.business_name)
 
 
     @function_tool

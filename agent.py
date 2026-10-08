@@ -139,7 +139,7 @@ FILLER_DELAY_S = 1.2  # lookups (normally ~0.6 s) faster than this get no filler
 
 # --- pipeline wiring ---------------------------------------------------------
 def _build_llm():
-    """Groq first (fastest TTFT) with Gemini as fallback; Gemini alone if no Groq key."""
+    """Gemini only for now. Groq (primary, Gemini fallback) is commented out below."""
     gemini = openai.LLM(
         model=LLM_MODEL,
         api_key=GOOGLE_API_KEY,
@@ -147,21 +147,23 @@ def _build_llm():
         temperature=LLM_TEMPERATURE,
         max_completion_tokens=MAX_TOKENS,
     )
-    if not GROQ_API_KEY:
-        return gemini
-    groq = openai.LLM(
-        model=GROQ_MODEL,
-        api_key=GROQ_API_KEY,
-        base_url="https://api.groq.com/openai/v1",
-        temperature=LLM_TEMPERATURE,
-        max_completion_tokens=MAX_TOKENS,
-        reasoning_effort=GROQ_REASONING_EFFORT or NOT_GIVEN,
-        # No SDK retries: a 429 (rate limit) must fail over to Gemini at once,
-        # not sit in exponential backoff while the caller waits.
-        max_retries=0,
-    )
-    # Groq normally starts in ~0.3 s; if it hasn't within 1.5 s, use Gemini.
-    return FallbackAdapter([groq, gemini], attempt_timeout=1.5, max_retry_per_llm=0)
+    return gemini
+    # --- Groq disabled for now: re-enable to make Groq primary, Gemini fallback ---
+    # if not GROQ_API_KEY:
+    #     return gemini
+    # groq = openai.LLM(
+    #     model=GROQ_MODEL,
+    #     api_key=GROQ_API_KEY,
+    #     base_url="https://api.groq.com/openai/v1",
+    #     temperature=LLM_TEMPERATURE,
+    #     max_completion_tokens=MAX_TOKENS,
+    #     reasoning_effort=GROQ_REASONING_EFFORT or NOT_GIVEN,
+    #     # No SDK retries: a 429 (rate limit) must fail over to Gemini at once,
+    #     # not sit in exponential backoff while the caller waits.
+    #     max_retries=0,
+    # )
+    # # Groq normally starts in ~0.3 s; if it hasn't within 1.5 s, use Gemini.
+    # return FallbackAdapter([groq, gemini], attempt_timeout=1.5, max_retry_per_llm=0)
 
 
 def _build_session(
@@ -262,6 +264,11 @@ _TOPIC = re.compile(
 
 _DEVANAGARI = re.compile(r"[ऀ-ॿ]")
 _LATIN = re.compile(r"[A-Za-z]")
+# Other Indic scripts (Bengali through Malayalam blocks).
+_FOREIGN_SCRIPT = re.compile(r"[ঀ-ൿ]")
+
+# Short transcripts below this STT confidence are treated as noise ("कि आछे?" at 0.18).
+MIN_TRANSCRIPT_CONFIDENCE = 0.3
 
 
 def _detect_language(text: str) -> str | None:
@@ -300,11 +307,31 @@ class BaseMayaAgent(Agent):
             "",
         )
         lang = _detect_language(last_user)
+        chat_ctx = chat_ctx.copy()
+        # Replies the caller cut off are fragments ("I can help"); the model copies
+        # them verbatim on later turns, so keep them out of what it sees.
+        chat_ctx.items = [
+            m for m in chat_ctx.items
+            if not (getattr(m, "role", None) == "assistant" and getattr(m, "interrupted", False))
+        ]
         if lang and lang != self.code:
             await self._switch_language(lang)
-            chat_ctx = chat_ctx.copy()
             chat_ctx.add_message(
                 role="system", content=f"The caller is now speaking {LANG_NAMES[lang]}; reply in {LANG_NAMES[lang]}."
+            )
+        # Last two replies identical = the model is stuck in a loop: nudge it out.
+        replies = [
+            (m.text_content or "").strip() for m in chat_ctx.items
+            if getattr(m, "role", None) == "assistant" and m.text_content
+        ]
+        if len(replies) >= 2 and replies[-1] == replies[-2]:
+            log.warning("LLM repeating itself (%r); adding a nudge", replies[-1])
+            chat_ctx.add_message(
+                role="system",
+                content=(
+                    f"Do NOT repeat your previous reply. Answer the caller's latest message directly in "
+                    f"{LANG_NAMES[self.code]}; if it was unclear, ask them what they meant."
+                ),
             )
         for attempt in range(2):
             produced = False
@@ -344,8 +371,13 @@ class BaseMayaAgent(Agent):
         text = new_message.text_content or ""
         # Drop near-silent noise ("Hmm", "Oh bro" at ~0.05 confidence) instead of answering it.
         conf = getattr(new_message, "transcript_confidence", None)
-        if conf is not None and conf < 0.15 and len(text.split()) <= 3:
+        if conf is not None and conf < MIN_TRANSCRIPT_CONFIDENCE and len(text.split()) <= 3:
             log.info("Ignoring low-confidence transcript %r (%.2f)", text, conf)
+            raise agents.StopResponse()
+        # Only English/Hindi are supported: text in another script (Bengali, Tamil...)
+        # is STT misreading noise or a stray word, not something to answer.
+        if _FOREIGN_SCRIPT.search(text) and not (_DEVANAGARI.search(text) or _LATIN.search(text)):
+            log.info("Ignoring transcript in an unsupported script %r", text)
             raise agents.StopResponse()
         lang = _detect_language(text)
         if lang and lang != self.code:
