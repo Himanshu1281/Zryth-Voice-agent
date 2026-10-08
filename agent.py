@@ -94,11 +94,12 @@ from prompts import (
 )
 from contact_flow import NO_TRANSFER, _ACCEPT, _BOOKING_WORDS, _HUMAN, _CALLBACK_WORDS, _NO, _NOT_A_YES, _OFFER, _WANT, _YES, clean_phone as _clean_phone
 from routing import CallConfig, resolve_call_config
-from tools import AppointmentTools, build_dynamic_tools, summarize_transcript
+from tools import CALLBACK_OFFER, AppointmentTools, build_dynamic_tools, summarize_transcript
 
 from database import (
     create_call,
     save_message,
+    update_call_lead,
     finish_call,
     save_call_summary,
     sync_knowledge_to_lancedb,
@@ -300,6 +301,30 @@ def _wrong_language(head: str, code: str) -> bool:
     return dev > lat
 
 
+# The caller is clearly ending the call (not just "thanks" mid-conversation).
+_CLEAR_GOODBYE = re.compile(
+    r"\b(?:bye|goodbye|that'?s all|that is all|no thanks?|nothing else|that'?s it|i'?m done)\b"
+    r"|बाय|बस इतना|और कुछ नहीं|अलविदा|फ़ोन रखता|फोन रखता|रखती हूँ|रखता हूँ",
+    re.I,
+)
+
+
+def _repeats_earlier(head: str, replies: list[str]) -> bool:
+    """True when this reply starts word-for-word like one Maya already gave
+    ("कोई बात नहीं। क्या आप मुझे बता सकते हैं कि आपकी टीम का..." six times in a row)."""
+    norm = lambda t: re.sub(r"\W+", " ", t).strip().lower()  # noqa: E731
+    h = norm(head)
+    return len(h) >= 25 and any(norm(r).startswith(h) for r in replies)
+
+
+class _CodeReply(Exception):
+    """A typed turn answered by code (see BaseMayaAgent._reply_by_code)."""
+
+    def __init__(self, line: str | None, goodbye: bool = False) -> None:
+        super().__init__(line)
+        self.line, self.goodbye = line, goodbye
+
+
 # Tagged onto the caller's latest message on every LLM call (see llm_node).
 _LANGUAGE_REMINDER: dict[str, str] = {
     "en": "Reply in English only.",
@@ -391,30 +416,54 @@ class BaseMayaAgent(Agent):
             chat_ctx.add_message(
                 role="system", content=f"The caller is now speaking {LANG_NAMES[lang]}; reply in {LANG_NAMES[lang]}."
             )
+        # Typed input (console) skips on_user_turn_completed, so the name/phone steps,
+        # booking starts and goodbyes never ran there: the LLM "noted" names it never
+        # saved. Run the same code for a caller message the hook hasn't seen.
+        last_msg = next(
+            (m for m in reversed(chat_ctx.items)
+             if getattr(m, "role", None) == "user" and getattr(m, "type", None) == "message"),
+            None,
+        )
+        if self.kb is not None and last_msg is not None and last_msg.id not in self._seen_user_ids():
+            self._seen_user_ids().add(last_msg.id)
+            self._typed_turn = True
+            try:
+                await self._code_turn(chat_ctx, last_msg, last_msg.text_content or "")
+            except _CodeReply as r:
+                if r.goodbye:
+                    self.kb.say_goodbye(self.session, self.code)
+                elif r.line:
+                    yield r.line
+                return
+            finally:
+                self._typed_turn = False
         # Last two replies identical = the model is stuck in a loop: nudge it out.
         replies = [
             (m.text_content or "").strip() for m in chat_ctx.items
             if getattr(m, "role", None) == "assistant" and m.text_content
         ]
-        if len(replies) >= 2 and replies[-1] == replies[-2]:
-            log.warning("LLM repeating itself (%r); adding a nudge", replies[-1])
-            chat_ctx.add_message(
-                role="system",
-                content=(
-                    f"Do NOT repeat your previous reply. Answer the caller's latest message directly in "
-                    f"{LANG_NAMES[self.code]}; if it was unclear, ask them what they meant."
-                ),
-            )
-        # The language rule buried in the long system prompt (followed by the English
-        # KB) was being ignored. A system message doesn't help with Gemini's native
-        # API (all system messages are merged into the instruction block BEFORE the
-        # conversation), so tag the caller's latest message itself: it's always the
-        # last thing the model reads. Only this LLM copy changes, not the transcript.
+        # System messages don't work reliably with Gemini's API because all system
+        # messages are merged before the conversation. We tag the caller's latest
+        # message itself -- it is always the last thing the model reads before generating.
+        nudges = []
         reminder = _LANGUAGE_REMINDER.get(self.code, _LANGUAGE_REMINDER["en"])
+        if reminder:
+            nudges.append(reminder)
+
+        # Loop / repetition detection:
+        if len(replies) >= 2 and any(r == replies[-1] for r in replies[:-1]):
+            log.warning("LLM repeating itself (%r); adding anti-loop nudge", replies[-1])
+            nudges.append("Do NOT repeat any previous question or sentence. Say something completely new.")
+
+        # Caller declined or said "nahi" / "no":
+        if _NO.search(last_user) and len(last_user.split()) <= 4:
+            nudges.append("The caller said no/declined. Do NOT ask for company or workflow details again. Say 'No problem!' and ask what questions they have about Zryth or offer a consultation.")
+
+        nudge_text = " ".join(nudges)
         for i in range(len(chat_ctx.items) - 1, -1, -1):
             m = chat_ctx.items[i]
             if getattr(m, "role", None) == "user" and getattr(m, "type", None) == "message":
-                chat_ctx.items[i] = m.model_copy(update={"content": [*m.content, f"\n\n({reminder})"]})
+                chat_ctx.items[i] = m.model_copy(update={"content": [*m.content, f"\n\n({nudge_text})"]})
                 break
         lang_retried = False
         for attempt in range(3):
@@ -425,6 +474,7 @@ class BaseMayaAgent(Agent):
             head = ""
             checking = not lang_retried
             wrong_lang = False
+            repeated = False
             async with contextlib.aclosing(
                 Agent.default.llm_node(self, chat_ctx, tools, model_settings)
             ) as stream:
@@ -449,10 +499,26 @@ class BaseMayaAgent(Agent):
                         if _wrong_language(head, self.code):
                             wrong_lang = True
                             break
+                        if _repeats_earlier(head, replies):
+                            repeated = True
+                            break
                         checking = False
                         for p in pending:
                             yield p
                         pending.clear()
+            if repeated:
+                lang_retried = True  # one regeneration per turn, whatever the reason
+                log.warning("LLM repeating an earlier reply (%r...); regenerating", head[:40])
+                chat_ctx = chat_ctx.copy()
+                chat_ctx.add_message(
+                    role="user",
+                    content=(
+                        "(You already said that. I don't want to answer that question. Don't ask it again: "
+                        f"say something new, in {LANG_NAMES[self.code]}, e.g. ask if I have any question about "
+                        f"{self.kb.config.business_name if self.kb else 'the company'}.)"
+                    ),
+                )
+                continue
             if wrong_lang:
                 lang_retried = True
                 log.warning("LLM replied in the wrong language (%r...); regenerating in %s", head[:40], self.code)
@@ -491,6 +557,7 @@ class BaseMayaAgent(Agent):
     ) -> None:
         """Inject the agent's relevant knowledge so the LLM answers in ONE round trip."""
         text = new_message.text_content or ""
+        self._seen_user_ids().add(new_message.id)  # llm_node must not handle it again
         if self.kb is not None and _HOLD.search(text):
             self.kb.hold_requested_at = time.monotonic()  # "hold on": wait longer before checking in
         # Drop near-silent noise ("Hmm", "Oh bro" at ~0.05 confidence) instead of answering it.
@@ -528,22 +595,7 @@ class BaseMayaAgent(Agent):
             )
         if self.kb is None:
             return
-        # Collecting name/phone: code handles the turn (contact_flow.py), not the LLM.
-        last_reply = next(
-            (m.text_content or "" for m in reversed(turn_ctx.items)
-             if getattr(m, "role", None) == "assistant" and m.text_content),
-            "",
-        )
-        if self.kb.contact.active:
-            await self._contact_turn(turn_ctx, new_message, text)
-        elif self.kb.saved_contact is not None and self.kb.caller_is_done(text, last_reply):
-            # Details saved and the caller is done ("नहीं, बस इतना ही"): hang up from
-            # code. Gemini sometimes just says "ज़रूर" and never calls end_call.
-            self._keep_user_turn(new_message)
-            self.kb.say_goodbye(self.session, self.code)
-            raise agents.StopResponse()
-        elif self.kb.saved_contact is None:
-            self._maybe_start_contact(turn_ctx, new_message, text)
+        await self._code_turn(turn_ctx, new_message, text)
         if self.kb.full_kb:
             # Whole KB is already in the system prompt: nothing to wait for. Run
             # the vector lookup in the background only to log knowledge gaps.
@@ -580,6 +632,66 @@ class BaseMayaAgent(Agent):
                 ),
             )
 
+    async def _code_turn(
+        self, turn_ctx: agents.llm.ChatContext, new_message: agents.llm.ChatMessage, text: str
+    ) -> None:
+        """Turns decided by code, not the LLM: the name/phone steps, hanging up once
+        details are saved, and starting the steps on a clear request. Raises (via
+        _reply_by_code) when code answers; returns when the LLM should reply."""
+        last_reply = next(
+            (m.text_content or "" for m in reversed(turn_ctx.items)
+             if getattr(m, "role", None) == "assistant" and m.text_content),
+            "",
+        )
+        # Count plain "nahi"/"no" replies in a row. After two, asking yet another
+        # question just loops ("कोई बात नहीं! कोई सवाल हैं?" x5): wrap up instead.
+        plain_no = bool(_NO.search(text)) and len(text.split()) <= 3 and not _YES.search(text)
+        self._no_streak = (getattr(self, "_no_streak", 0) + 1) if plain_no else 0
+        if self.kb.contact.active:
+            await self._contact_turn(turn_ctx, new_message, text)
+        elif self._no_streak >= 2:
+            if self.kb.saved_contact is None and not self.kb.callback_offered:
+                self.kb.callback_offered = True
+                self._reply_by_code(new_message, CALLBACK_OFFER.get(self.code, CALLBACK_OFFER["en"]))
+            self._reply_by_code(new_message, goodbye=True)
+        elif self.kb.saved_contact is not None and self.kb.caller_is_done(text, last_reply):
+            # Details saved and the caller is done ("नहीं, बस इतना ही"): hang up from
+            # code. Gemini sometimes just says "ज़रूर" and never calls end_call.
+            self._reply_by_code(new_message, goodbye=True)
+        elif self.kb.saved_contact is None and (
+            _CLEAR_GOODBYE.search(text) or (plain_no and self.kb.callback_offered)
+        ) and "?" not in text:
+            # Caller is leaving with nothing saved: offer a callback once (not when they
+            # are turning down an offer Maya just made), then hang up. Done in code: the
+            # LLM's "caller said no" nudge made it ask "any other questions?" forever.
+            if not self.kb.callback_offered and not _OFFER.search(last_reply):
+                self.kb.callback_offered = True
+                self._reply_by_code(new_message, CALLBACK_OFFER.get(self.code, CALLBACK_OFFER["en"]))
+            self._reply_by_code(new_message, goodbye=True)
+        elif self.kb.saved_contact is None:
+            self._maybe_start_contact(turn_ctx, new_message, text)
+
+    def _reply_by_code(
+        self, new_message: agents.llm.ChatMessage, line: str | None = None, goodbye: bool = False
+    ) -> None:
+        """Answer this turn with a fixed line (or the goodbye) instead of the LLM.
+        Spoken turns: keep the caller's message and stop the LLM. Typed turns (console)
+        come through llm_node instead, which catches _CodeReply and outputs the line."""
+        if getattr(self, "_typed_turn", False):
+            raise _CodeReply(line, goodbye)
+        self._keep_user_turn(new_message)
+        if goodbye:
+            self.kb.say_goodbye(self.session, self.code)
+        else:
+            self.session.say(line)
+        raise agents.StopResponse()
+
+    def _seen_user_ids(self) -> set:
+        """Caller messages already handled by on_user_turn_completed."""
+        if not hasattr(self, "_seen_ids"):
+            self._seen_ids: set = set()
+        return self._seen_ids
+
     def _keep_user_turn(self, msg: agents.llm.ChatMessage) -> None:
         """Record the caller's words before a StopResponse. LiveKit drops the user
         message when on_user_turn_completed raises StopResponse, so without this the
@@ -605,7 +717,7 @@ class BaseMayaAgent(Agent):
         # "Okay thanks, bye" after an offer is a goodbye, not a yes.
         accepted = (
             bool(_OFFER.search(last_reply)) and "?" in last_reply
-            and len(text.split()) <= 6 and bool(_YES.search(text) or _ACCEPT.search(text))
+            and len(text.split()) <= 8 and bool(_YES.search(text) or _ACCEPT.search(text))
             and not _NO.search(text)
             and not _NOT_A_YES.search(text)
         )
@@ -626,20 +738,19 @@ class BaseMayaAgent(Agent):
         tool = "book_consultation" if booking else "capture_lead"
         recent = [
             m.text_content for m in turn_ctx.items
-            if getattr(m, "role", None) == "user" and m.text_content
+            if getattr(m, "role", None) == "user" and m.text_content and m.id != new_message.id
         ][-2:] + [text]
         requirement = " | ".join(recent)[:300] or None
         if wants_human:
             requirement = f"Wanted to talk to a person | {requirement}"
-        log.info("%s started from code (asked=%s, accepted offer=%s, human=%s)", tool, asked, accepted, wants_human)
+        known_name = getattr(self.kb, "known_name", None) or self.kb.contact.name
+        log.info("%s started from code (asked=%s, accepted offer=%s, human=%s, name=%s)", tool, asked, accepted, wants_human, known_name)
         line = self.kb.contact.start(
-            tool, requirement, None, self.code, _clean_phone(self.kb.caller_phone), opener=not wants_human
+            tool, requirement, known_name, self.code, _clean_phone(self.kb.caller_phone), opener=not wants_human
         )
         if wants_human:
             line = NO_TRANSFER.get(self.code, NO_TRANSFER["en"]) + line
-        self._keep_user_turn(new_message)
-        self.session.say(line)
-        raise agents.StopResponse()
+        self._reply_by_code(new_message, line)
 
     async def _contact_turn(
         self, turn_ctx: agents.llm.ChatContext, new_message: agents.llm.ChatMessage, text: str
@@ -651,14 +762,24 @@ class BaseMayaAgent(Agent):
         step = kb.contact.handle(
             text, self.code, caller, is_question=bool(_QUESTION.search(text)) and not re.search(r"\d", text)
         )
+        if kb.contact.name:
+            kb.known_name = kb.contact.name
+            if kb.call_id:
+                asyncio.create_task(
+                    asyncio.to_thread(
+                        update_call_lead,
+                        call_id=kb.call_id,
+                        customer_name=kb.contact.name,
+                        phone=kb.contact.phone or caller or None,
+                        requirement=kb.contact.requirement,
+                    )
+                )
         if step.save:
             line = await kb.finish_contact(self.code)
         else:
             line = step.say
         if line:
-            self._keep_user_turn(new_message)
-            self.session.say(line)
-            raise agents.StopResponse()
+            self._reply_by_code(new_message, line)
         if step.reprompt:
             turn_ctx.add_message(
                 role="system",
@@ -788,6 +909,10 @@ async def entrypoint(ctx: JobContext) -> None:
             phone = ctx.room.metadata
         elif "+" in ctx.room.name:
             phone = ctx.room.name
+        else:
+            m = re.search(r"(\+?\d{10,12})", ctx.room.name or "")
+            if m:
+                phone = m.group(1)
 
     config = await asyncio.to_thread(resolve_call_config, dialed)
     if config.blocked:
@@ -925,6 +1050,21 @@ async def entrypoint(ctx: JobContext) -> None:
                 )
             except Exception:
                 log.exception("Failed to save call summary")
+
+        # Fallback for dashboard: ensure lead details are recorded
+        final_name = getattr(tools_instance, "known_name", None) or tools_instance.contact.name
+        final_phone = tools_instance.contact.phone or _clean_phone(tools_instance.caller_phone)
+        if final_name or final_phone:
+            try:
+                await asyncio.to_thread(
+                    update_call_lead,
+                    call_id=call_id,
+                    customer_name=final_name or "Caller",
+                    phone=final_phone,
+                    requirement=tools_instance.contact.requirement,
+                )
+            except Exception:
+                log.exception("Failed to update final call lead on shutdown")
 
     ctx.add_shutdown_callback(on_shutdown)
 

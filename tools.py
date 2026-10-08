@@ -472,7 +472,7 @@ def _user_turns(context: RunContext) -> int:
 
 # end_call's one-time offer before hanging up on a caller whose details weren't
 # saved. A "yes" starts the contact flow (it matches contact_flow._OFFER).
-_CALLBACK_OFFER = {
+CALLBACK_OFFER = {
     "en": "Before you go, should our team call you back with more details?",
     "hi": "जाने से पहले, क्या हमारी टीम आपको ज़्यादा जानकारी के लिए वापस कॉल करे?",
 }
@@ -508,6 +508,8 @@ class AppointmentTools:
         self.caller_phone: str | None = None
         # (name, phone) already saved this call -- stops duplicate bookings.
         self.saved_contact: tuple[str, str] | None = None
+        # Caller name remembered across turns to never re-ask
+        self.known_name: str | None = None
         # Name + phone collection, driven turn by turn from agent.on_user_turn_completed.
         self.contact = ContactFlow()
         # end_call defers once to offer a callback when no details were saved.
@@ -579,9 +581,11 @@ class AppointmentTools:
                 "Not started: the caller hasn't asked for a callback, demo or consultation. "
                 "Don't ask for their name or number; just keep the conversation going."
             )
-        name = (name or "").strip()
+        name = (name or self.known_name or self.contact.name or "").strip()
         if name.lower() in _PLACEHOLDERS or not _user_said_name(context, name):
-            name = None
+            name = self.known_name or None
+        else:
+            self.known_name = name
         log.info("%s: contact flow started (name known=%s, caller id=%s)", tool, bool(name), bool(caller))
         context.session.say(self.contact.start(tool, requirement, name, lang, caller))
         return None
@@ -589,8 +593,8 @@ class AppointmentTools:
     async def finish_contact(self, lang: str) -> str:
         """Save the confirmed name + number; returns the line to speak."""
         flow = self.contact
-        name, phone = flow.name or "", flow.phone or ""
-        if self.call_id:
+        name, phone = flow.name or self.known_name or "", flow.phone or _clean_phone(self.caller_phone) or ""
+        if self.call_id and (name or phone):
             try:
                 await asyncio.to_thread(
                     update_call_lead,
@@ -602,7 +606,8 @@ class AppointmentTools:
             except Exception:
                 log.exception("Saving contact details failed")
         self.saved_contact = (name, phone)
-        log.info("%s -> %s saved", flow.tool, name)
+        self.known_name = name
+        log.info("%s -> %s (%s) saved", flow.tool, name, phone)
         text = flow.saved_text(lang, self.config.business_name)
         flow.reset()
         return text
@@ -803,7 +808,7 @@ class AppointmentTools:
             # Spoken as a fixed line: as an instruction, the LLM read "Don't hang up
             # yet." aloud to the caller.
             lang = getattr(context.session.current_agent, "code", "en")
-            context.session.say(_CALLBACK_OFFER.get(lang, _CALLBACK_OFFER["en"]))
+            context.session.say(CALLBACK_OFFER.get(lang, CALLBACK_OFFER["en"]))
             return None
 
         # The LLM sometimes asks the callback question AND calls end_call again in the

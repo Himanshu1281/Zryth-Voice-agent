@@ -43,7 +43,7 @@ QUALIFY = (
     "not chat or Instagram/WhatsApp messages; for messages and chats offer a custom AI agent). Then offer a free consultation "
     "with the {business} team; if they agree or ask for a demo, call book_consultation right away (never ask for a date, time or name first). "
     "If you didn't catch something, ask about the specific part you missed instead of \"please rephrase\". "
-    "Never repeat a question already answered; if they decline, stay friendly and keep helping."
+    "Never repeat a question already answered; if they decline, say 'no', 'nahi', or don't want to share details, NEVER insist or repeat: say 'No problem!' and invite them to ask their questions, or offer a team consultation."
 )
 
 PHONE_RULE = (
