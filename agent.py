@@ -92,9 +92,9 @@ from prompts import (
     build_instructions,
     greeting,
 )
-from contact_flow import NO_TRANSFER, _ACCEPT, _BOOKING_WORDS, _HUMAN, _CALLBACK_WORDS, _NO, _NOT_A_YES, _OFFER, _WANT, _YES, clean_phone as _clean_phone
+from contact_flow import NO_TRANSFER, _ACCEPT, _ALREADY_TOLD, name_from_history, _BOOKING_WORDS, _HUMAN, _CALLBACK_WORDS, _NO, _NOT_A_YES, _OFFER, _WANT, _YES, clean_phone as _clean_phone
 from routing import CallConfig, resolve_call_config
-from tools import CALLBACK_OFFER, AppointmentTools, build_dynamic_tools, summarize_transcript
+from tools import CALLBACK_OFFER, SAY_MARKER, AppointmentTools, build_dynamic_tools, summarize_transcript
 
 from database import (
     create_call,
@@ -406,6 +406,11 @@ class BaseMayaAgent(Agent):
         """Cap every spoken reply at MAX_REPLY_SENTENCES: the prompt asks for 1-2
         sentences but Gemini still gave 4-5 sentence answers (15-18 s of audio).
         Text is cut at a sentence boundary; tool calls pass through untouched."""
+        # A tool asked for an exact line (tools.speak): say it, no LLM call.
+        last = chat_ctx.items[-1] if chat_ctx.items else None
+        if getattr(last, "type", None) == "function_call_output" and str(last.output).startswith(SAY_MARKER):
+            yield str(last.output)[len(SAY_MARKER):]
+            return
         live = MAX_REPLY_SENTENCES - 1  # sentences spoken as they stream
         sentences = 0
         held = ""   # text after the last space: a "." there may be "FinanceAuditor.ai"
@@ -748,6 +753,15 @@ class BaseMayaAgent(Agent):
             self.session.say(line)
         raise agents.StopResponse()
 
+    @staticmethod
+    def _user_texts(turn_ctx: agents.llm.ChatContext, new_message: agents.llm.ChatMessage) -> list[str]:
+        """Caller messages so far, oldest first, including this turn's (once)."""
+        texts = [
+            m.text_content for m in turn_ctx.items
+            if getattr(m, "role", None) == "user" and m.text_content and m.id != new_message.id
+        ]
+        return texts + [new_message.text_content or ""]
+
     def _seen_user_ids(self) -> set:
         """Caller messages already handled by on_user_turn_completed."""
         if not hasattr(self, "_seen_ids"):
@@ -805,7 +819,10 @@ class BaseMayaAgent(Agent):
         requirement = " | ".join(recent)[:300] or None
         if wants_human:
             requirement = f"Wanted to talk to a person | {requirement}"
-        known_name = getattr(self.kb, "known_name", None) or self.kb.contact.name
+        known_name = (
+            getattr(self.kb, "known_name", None) or self.kb.contact.name
+            or name_from_history(self._user_texts(turn_ctx, new_message))
+        )
         log.info("%s started from code (asked=%s, accepted offer=%s, human=%s, name=%s)", tool, asked, accepted, wants_human, known_name)
         line = self.kb.contact.start(
             tool, requirement, known_name, self.code, _clean_phone(self.kb.caller_phone), opener=not wants_human
@@ -821,6 +838,9 @@ class BaseMayaAgent(Agent):
         stops the LLM, or (caller asked something else) lets the LLM answer and re-ask."""
         kb = self.kb
         caller = _clean_phone(kb.caller_phone)
+        if kb.contact.stage == "name" and not kb.contact.name and _ALREADY_TOLD.search(text):
+            # "abhi tho bola": they gave it to the LLM earlier; find it instead of re-asking.
+            kb.contact.name = kb.known_name or name_from_history(self._user_texts(turn_ctx, new_message))
         step = kb.contact.handle(
             text, self.code, caller, is_question=bool(_QUESTION.search(text)) and not re.search(r"\d", text)
         )

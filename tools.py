@@ -14,7 +14,7 @@ from google import genai
 from livekit.agents import JobContext, RunContext, function_tool
 from livekit.agents.beta.workflows import WarmTransferTask
 
-from contact_flow import _BOOKING_WORDS, _CALLBACK_WORDS, _OFFER, ContactFlow, clean_phone
+from contact_flow import _BOOKING_WORDS, _CALLBACK_WORDS, _OFFER, ContactFlow, clean_phone, name_from_history
 from routing import DEFAULT_CONFIG, CallConfig
 from database import log_knowledge_gap, update_call_lead
 from dynamic_executor import execute_tool_call, is_executable
@@ -380,6 +380,16 @@ def _clean_phone(phone: str | None) -> str | None:
 _PLACEHOLDERS = {"", "user", "caller", "customer", "unknown", "none", "null", "n/a", "na", "name", "phone"}
 
 
+# Tool result that agent.llm_node speaks word for word instead of asking the LLM.
+# (session.say() from inside a tool was queued behind the reply still playing:
+# the name question came 4 turns late while Gemini invented "we've booked it".)
+SAY_MARKER = "[[SAY]]"
+
+
+def speak(line: str) -> str:
+    return SAY_MARKER + line
+
+
 def _user_texts(context: RunContext) -> list[str]:
     """Caller transcripts so far, oldest first ([] if the history can't be read)."""
     try:
@@ -541,7 +551,7 @@ class AppointmentTools:
         context: RunContext,
         requirement: Optional[str] = None,
         name: Optional[str] = None,
-    ) -> None:
+    ) -> str | None:
         """Start taking the caller's contact details so the team can call them back.
 
         Use when the caller shows interest or agrees to a callback but has NOT asked
@@ -557,13 +567,14 @@ class AppointmentTools:
                 company or institute name.
         """
 
-        await self._start_contact(context, "capture_lead", name, requirement)
+        return await self._start_contact(context, "capture_lead", name, requirement)
 
     async def _start_contact(
         self, context: RunContext, tool: str, name: Optional[str], requirement: Optional[str]
-    ) -> None:
+    ) -> str | None:
         """Shared by capture_lead/book_consultation: hand the conversation to the
-        contact flow, which speaks every question itself (see contact_flow.py)."""
+        contact flow (contact_flow.py). Returns the first question as a speak() line,
+        which agent.llm_node says word for word."""
         lang = getattr(context.session.current_agent, "code", "en")
         caller = _clean_phone(self.caller_phone)
         if self.saved_contact is not None:
@@ -571,8 +582,7 @@ class AppointmentTools:
             return None
         if self.contact.active:
             # The LLM called again mid-flow: just repeat the pending question.
-            context.session.say(self.contact.question(lang, caller))
-            return None
+            return speak(self.contact.question(lang, caller))
         if not _wants_contact(context):
             # e.g. "yes" to "what kind of business do you have?" made Gemini call
             # capture_lead and start asking for a name out of nowhere.
@@ -583,12 +593,13 @@ class AppointmentTools:
             )
         name = (name or self.known_name or self.contact.name or "").strip()
         if name.lower() in _PLACEHOLDERS or not _user_said_name(context, name):
-            name = self.known_name or None
-        else:
+            # The LLM may have heard the name already ("merra name Himanshu hai" ->
+            # "Got it, Himanshu") without passing it: take it from what the caller said.
+            name = self.known_name or name_from_history(_user_texts(context)) or None
+        if name:
             self.known_name = name
         log.info("%s: contact flow started (name known=%s, caller id=%s)", tool, bool(name), bool(caller))
-        context.session.say(self.contact.start(tool, requirement, name, lang, caller))
-        return None
+        return speak(self.contact.start(tool, requirement, name, lang, caller))
 
     async def finish_contact(self, lang: str) -> str:
         """Save the confirmed name + number; returns the line to speak."""
@@ -660,7 +671,7 @@ class AppointmentTools:
         preferred_date: Optional[str] = None,
         preferred_time: Optional[str] = None,
         name: Optional[str] = None,
-    ) -> None:
+    ) -> str | None:
         """Book a consultation / demo / meeting with the team.
 
         Call it IMMEDIATELY when the caller asks for a meeting, call or demo, or
@@ -680,7 +691,7 @@ class AppointmentTools:
                 company or institute name.
         """
 
-        await self._start_contact(
+        return await self._start_contact(
             context, "book_consultation", name,
             _with_preferred_slot(requirement, preferred_date, preferred_time),
         )

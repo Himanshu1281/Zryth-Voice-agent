@@ -26,6 +26,9 @@ TEXTS: dict[str, dict[str, str]] = {
         "sure": "Sure! ",
         "drop": "No problem, let's skip that. What else can I help you with?",
         "ask_name_again": "Sorry, I didn't catch your name. Could you tell me just your name?",
+        "name_missed": "Sorry, I missed it. Could you tell me your name once more?",
+        "no_caller_id": "Sorry, I can't see the number you're calling from. Could you tell me your ten-digit mobile number?",
+        "time_noted": "Got it, I've noted that time. Could you tell me your ten-digit mobile number?",
         "ask_choice": "Thanks, {name}. Would you like to get a callback on this number, or another one?",
         "ask_choice_again": "Sorry, should we call you back on the number you're calling from, or on a different number?",
         "ask_digits": "Sure. Could you tell me your ten-digit mobile number?",
@@ -45,6 +48,9 @@ TEXTS: dict[str, dict[str, str]] = {
         "sure": "ज़रूर! ",
         "drop": "कोई बात नहीं, रहने देते हैं। बताइए, मैं और कैसे मदद कर सकती हूँ?",
         "ask_name_again": "माफ़ कीजिए, नाम ठीक से सुनाई नहीं दिया। क्या आप सिर्फ़ अपना नाम बता सकते हैं?",
+        "name_missed": "माफ़ कीजिए, मुझसे छूट गया। क्या आप एक बार फिर अपना नाम बता सकते हैं?",
+        "no_caller_id": "माफ़ कीजिए, मुझे आपका नंबर दिखाई नहीं दे रहा। क्या आप अपना दस अंकों का मोबाइल नंबर बता सकते हैं?",
+        "time_noted": "ठीक है, मैंने समय नोट कर लिया है। क्या आप अपना दस अंकों का मोबाइल नंबर बता सकते हैं?",
         "ask_choice": "धन्यवाद {name} जी। क्या आप इसी नंबर पर कॉल बैक चाहेंगे, या किसी दूसरे नंबर पर?",
         "ask_choice_again": "माफ़ कीजिए, क्या हम आपको इसी नंबर पर कॉल करें, या किसी दूसरे नंबर पर?",
         "ask_digits": "ज़रूर। क्या आप अपना दस अंकों का मोबाइल नंबर बता सकते हैं?",
@@ -119,7 +125,7 @@ def _words_to_digits(text: str) -> str:
 
 
 _YES = re.compile(
-    r"\b(?:yes|yeah|yep|yup|correct|right|sure|ok|okay|perfect|absolutely|haan|han|ha|ji|sahi|theek)\b"
+    r"\b(?:yes|yeah|yep|yup|correct|right|sure|ok|okay|perfect|absolutely|haan|han|ha|ji|jee|sahi|theek)\b"
     r"|हाँ|हां|हा\b|जी|सही|ठीक|बिल्कुल|बिलकुल|ओके|करेक्ट",
     re.I,
 )
@@ -138,7 +144,9 @@ _DIFFERENT = re.compile(
 _ALREADY_TOLD = re.compile(
     r"\b(?:already (?:told|said|gave)|told you|said it|i told you|already|said)\b|"
     r"बोला\s*त[ोॉ]\s*सही|bola\s*th?o\s*sahi|बोल\s*तो\s*दिया|bol\s*to\s*diya|"
-    r"पहले\s*(?:ही\s*)?बता(?:या| दिया| चुके)|pehle\s*hi\s*bata",
+    r"पहले\s*(?:ही\s*)?बता(?:या| दिया| चुके)|pehle\s*hi\s*bata|"
+    r"abhi\s*t?h?o\s*(?:bola|bataya|kaha)|bata(?:ya)?\s*(?:to|na|tha)\b|bola\s*(?:to|na|tha)\b|"
+    r"अभी\s*तो\s*(?:बोला|बताया|कहा)|बताया\s*(?:तो|ना|था)|बोला\s*(?:ना|था)",
     re.I,
 )
 
@@ -180,7 +188,7 @@ NO_TRANSFER: dict[str, str] = {
 }
 
 _ACCEPT = re.compile(
-    r"\b(?:interested|sounds good|go ahead|let's do it|lets do it|why not|please do|sure)\b"
+    r"\b(?:interested|sounds good|go ahead|let's do it|lets do it|why not|please do|sure|jarur|jaroor|zaroor|zarur|bilkul)\b"
     r"|ज़रूर|जरूर|चलिए|कर दीजिए|कर दो|बिल्कुल|बिलकुल",
     re.I,
 )
@@ -193,7 +201,7 @@ _OFFER = re.compile(
 # Robust Name extraction patterns
 _NAME_PATTERNS = [
     re.compile(r"(?:my name is|name is|name's|i am|i'm|this is|it's|myself|this side|call me)\s+(.+)", re.I),
-    re.compile(r"(?:mera|meri|humara)?\s*naam\s+(?:hai\s+)?(.+)", re.I),
+    re.compile(r"(?:mera|merra|meraa|meri|humara|my)?\s*(?:naam|nam|name)\s+(?:hai\s+|is\s+)?(.+)", re.I),
     re.compile(r"(?:मेरा|मेरी|हमारा)?\s*नाम\s+(?:है\s+)?(.+)"),
     re.compile(r"(?:main|mai|hum)\s+(.+?)\s+(?:bol raha|bol rahi|hoon|hun|baat kar)", re.I),
     re.compile(r"मैं\s+(.+?)\s+(?:हूँ|हूं|बोल\s+रह[ाी])"),
@@ -217,6 +225,26 @@ _NOT_NAMES = {
     "nothing", "none", "user", "caller", "test", "demo", "callback", "consultation",
     "हाँ", "हां", "नहीं", "नही", "ठीक", "सही", "गलत", "नमस्ते", "हेलो"
 }
+
+
+# A preferred date/time ("tomorrow 8 am", "kal shaam 5 baje"), not phone digits.
+_TIME_OR_DATE = re.compile(
+    r"\b(?:\d{1,2}(?::\d{2})?\s*(?:am|pm|a\.m\.|p\.m\.|baje|o'?clock)|tomorrow|today|tonight|"
+    r"morning|evening|afternoon|monday|tuesday|wednesday|thursday|friday|saturday|sunday|"
+    r"kal|parso|aaj|subah|shaam|dopahar)\b|बजे|कल|परसों|आज|सुबह|शाम|दोपहर",
+    re.I,
+)
+
+
+def name_from_history(user_texts: list[str]) -> str | None:
+    """A name the caller already gave earlier ("merra name Himanshu hai" to the LLM),
+    newest first. Only explicit introductions count, not any short reply."""
+    for t in reversed(user_texts[-6:]):
+        if any(p.search(t or "") for p in _NAME_PATTERNS[:5]):
+            name = extract_name(t)
+            if name:
+                return name
+    return None
 
 
 def spoken(digits: str) -> str:
@@ -244,8 +272,8 @@ def extract_digits(text: str) -> str:
 def extract_name(text: str) -> str | None:
     """Extract caller name reliably across English, Hindi and Romanized Hindi."""
     t = (text or "").strip()
-    if not t:
-        return None
+    if not t or _ALREADY_TOLD.search(t):
+        return None  # "abhi tho bola" is "I already told you", not a name
     # Strip long numeric strings if caller provided digits in the same turn
     t_clean = re.sub(r"[\+\d\s-]{7,}", " ", t).strip()
     if not t_clean:
@@ -388,13 +416,9 @@ class ContactFlow:
         if _ALREADY_TOLD.search(text):
             if self.name:
                 return Step(say=self._after_name(lang, caller))
-            elif caller:
-                self.stage = "choice"
-                line = self._t("ask_choice", lang, name="").replace("Thanks, .", "Sure!").replace("धन्यवाद  जी।", "ज़रूर!")
-                return Step(say=line)
-            else:
-                self.stage = "digits"
-                return Step(say=self._t("ask_digits", lang))
+            # The agent looks the name up in the conversation first (name_from_history);
+            # only if that found nothing do we get here: apologise and ask once more.
+            return Step(say=self._t("name_missed", lang))
 
         # A bare "nahi" / "no" to "may I know your name?" means they won't give it:
         # stop asking instead of "didn't catch your name" again and again.
@@ -431,9 +455,19 @@ class ContactFlow:
         return self._unclear(lang, caller, "ask_choice_again", is_question)
 
     def _on_digits(self, text: str, lang: str, is_question: bool) -> Step:
+        if _TIME_OR_DATE.search(text) and len(extract_digits(text)) < 5:
+            # "tomorrow 8 am" is when to call, not the start of a phone number:
+            # keep it as the preferred slot and ask for the number again.
+            slot = f"Preferred: {text.strip()}"
+            self.requirement = f"{self.requirement} ({slot})" if self.requirement else slot
+            return Step(say=self._t("time_noted", lang))
         new = extract_digits(text)
         if not new:
             self.digits = ""
+            if _SAME.search(text) or _ALREADY_TOLD.search(text):
+                # "same number" when we can't see the caller ID (console, hidden number):
+                # say why we still need it instead of repeating the question.
+                return Step(say=self._t("no_caller_id", lang))
             return self._unclear(lang, None, "ask_digits", is_question)
         self.unclear = 0
         buf = self.digits + new
