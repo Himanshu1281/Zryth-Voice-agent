@@ -301,6 +301,16 @@ def _wrong_language(head: str, code: str) -> bool:
     return dev > lat
 
 
+# Spoken replies are cut after this many sentences (see llm_node).
+MAX_REPLY_SENTENCES = int(os.getenv("MAX_REPLY_SENTENCES", "3"))
+# A sentence ends at . ! ? or । followed by a space or newline ("FinanceAuditor.ai"
+# and "2.5" are not sentence ends).
+_SENTENCE_END = re.compile(r"[.!?।](?=\s)")
+_LENGTH_RULE: dict[str, str] = {
+    "en": "Answer in 1-2 short sentences (never more than 3), then at most one short question.",
+    "hi": "जवाब 1-2 छोटे वाक्यों में दें (3 से ज़्यादा कभी नहीं), फिर ज़्यादा से ज़्यादा एक छोटा सवाल।",
+}
+
 # The caller is clearly ending the call (not just "thanks" mid-conversation).
 _CLEAR_GOODBYE = re.compile(
     r"\b(?:bye|goodbye|that'?s all|that is all|no thanks?|nothing else|that'?s it|i'?m done)\b"
@@ -393,6 +403,56 @@ class BaseMayaAgent(Agent):
     code: str = "en"
 
     async def llm_node(self, chat_ctx, tools, model_settings):
+        """Cap every spoken reply at MAX_REPLY_SENTENCES: the prompt asks for 1-2
+        sentences but Gemini still gave 4-5 sentence answers (15-18 s of audio).
+        Text is cut at a sentence boundary; tool calls pass through untouched."""
+        live = MAX_REPLY_SENTENCES - 1  # sentences spoken as they stream
+        sentences = 0
+        held = ""   # text after the last space: a "." there may be "FinanceAuditor.ai"
+        tail = None  # once `live` sentences are out, the rest is buffered here
+        async for chunk in self._llm_node_inner(chat_ctx, tools, model_settings):
+            if isinstance(chunk, str):
+                text = chunk
+            elif getattr(chunk, "delta", None) is not None and not chunk.delta.tool_calls:
+                text = chunk.delta.content or ""
+            else:
+                yield chunk  # tool call (or anything else): never cut
+                continue
+            if tail is not None:
+                tail += text
+                continue
+            buf = held + text
+            for m in _SENTENCE_END.finditer(buf):
+                sentences += 1
+                if sentences >= live:
+                    yield buf[: m.end()]
+                    tail, held = buf[m.end():], ""
+                    break
+            if tail is not None:
+                continue
+            # Emit up to the last whitespace; hold the tail until we know whether
+            # its "." / "?" ends a sentence (needs the following space).
+            split = max(buf.rfind(" "), buf.rfind("\n")) + 1
+            if split > 0:
+                yield buf[:split]
+                held = buf[split:]
+            else:
+                held = buf
+        if tail is None:
+            if held:
+                yield held
+            return
+        # One more sentence at most. If the model went on longer, keep its closing
+        # question ("Would you like to know more?"), which moves the call forward.
+        rest = [s for s in re.split(r"(?<=[.!?।])\s+", tail.strip()) if s.strip()]
+        if len(rest) > 1:
+            log.info("reply capped at %d sentences (dropped %d)", MAX_REPLY_SENTENCES, len(rest) - 1)
+            last = rest[-1]
+            rest = [last] if last.rstrip().endswith("?") else [rest[0]]
+        if rest:
+            yield " " + rest[0]
+
+    async def _llm_node_inner(self, chat_ctx, tools, model_settings):
         """Pass the LLM stream through. Gemini intermittently (~5%) returns an
         empty reply: retry once silently, then fall back to a short line rather
         than leave the caller in dead air."""
@@ -459,6 +519,8 @@ class BaseMayaAgent(Agent):
         if _NO.search(last_user) and len(last_user.split()) <= 4:
             nudges.append("The caller said no/declined. Do NOT ask for company or workflow details again. Say 'No problem!' and ask what questions they have about Zryth or offer a consultation.")
 
+        # Last thing the model reads, so it keeps answers short (llm_node also cuts).
+        nudges.append(_LENGTH_RULE.get(self.code, _LENGTH_RULE["en"]))
         nudge_text = " ".join(nudges)
         for i in range(len(chat_ctx.items) - 1, -1, -1):
             m = chat_ctx.items[i]
