@@ -41,3 +41,6 @@ data/backups/
 
 # Local debugging scripts (not deployed)
 test_search.py
+
+# Business profiles generated from customer KBs (rebuilt by the worker)
+data/profiles/

@@ -14,6 +14,7 @@ from google import genai
 from livekit.agents import JobContext, RunContext, function_tool
 from livekit.agents.beta.workflows import WarmTransferTask
 
+from business import BusinessProfile, build_profile, cached_profile
 from contact_flow import ContactFlow, clean_phone, name_from_history
 from intents import (
     ACK, BOOKING_WORDS, CALLBACK_WORDS, CONTACT_WORDS, GOODBYE, OFFER, PRICING_QUESTION, SHORT_NO, SIGNOFF, SMALL_TALK,
@@ -43,20 +44,15 @@ _GAP_THRESHOLD = 0.55      # best match below this = KB probably can't answer
 _MIN_GAP_WORDS = 3         # don't log fragments as knowledge gaps
 _RETRIEVAL_TIMEOUT_S = 1.5 # never hold the reply longer than this
 
-# STT mis-hearings of Zryth names -> spelling used in the knowledge base.
-# Sarvam STT has no keyterm boosting, so we normalise before retrieval.
-_NAME_ALIASES = [
-    # Hindi STT of "Oswaal AI": "उस वाले ऐसे", "उस वाले आए", "एशो oil" (seen on live calls).
-    (re.compile(r"(?:उस ?वाले?|ओ[सस्]+वाल|एशो)\s+(?:ए\s?आई|एआई|ऐसे|आए|ए|AI|oil)(?=[\s।.?!,]|$)", re.I), "Oswaal AI"),
-    (re.compile(r"ओस्?वाल"), "Oswaal"),
-    (re.compile(r"\b(?:oswal|oswall|osval|oswaal)\b", re.I), "Oswaal"),
-    (re.compile(r"\b(?:zyrth|zrith|zerith|zirith|zirth|zerth|zareth|zarith|zarid|zerid|zaret)\b", re.I), "Zryth"),
-]
-
-
-def normalise_names(text: str) -> str:
-    for pattern, canonical in _NAME_ALIASES:
-        text = pattern.sub(canonical, text)
+def normalise_names(text: str, aliases: dict[str, str] | None = None) -> str:
+    """Fix speech-to-text mishearings of the business's brand names before retrieval.
+    Sarvam STT has no keyterm boosting. The aliases (regex -> name) come from the
+    business profile (business_profiles/<agent>.json)."""
+    for pattern, canonical in (aliases or {}).items():
+        try:
+            text = re.sub(pattern, canonical, text, flags=re.I)
+        except re.error:
+            log.warning("bad alias pattern %r", pattern)
     return text
 
 
@@ -133,6 +129,48 @@ def load_full_kb(agent_id: str | None = None) -> str | None:
     return text
 
 
+def load_kb_text(agent_id: str | None = None, max_chars: int = 30000) -> str | None:
+    """One agent's KB text (first max_chars), for the business profile even when the
+    KB is too big for the prompt. None if empty/missing."""
+    import lancedb
+    from database import LANCEDB_PATH
+
+    try:
+        if not os.path.exists(LANCEDB_PATH):
+            return None
+        table = lancedb.connect(LANCEDB_PATH).open_table("knowledge")
+        rows = (
+            table.search().where(_kb_filter(agent_id), prefilter=True)
+            .select(["id", "content"]).limit(10_000).to_list()
+        )
+    except Exception:  # noqa: BLE001 - no KB just means a default profile
+        return None
+    text = "\n\n".join(r["content"] for r in sorted(rows, key=lambda r: r["id"]))
+    return text[:max_chars] or None
+
+
+def warm_profiles() -> int:
+    """Build (or confirm cached) the business profile of every agent in the local KB,
+    so no call waits for one. Uses the same KB text as AppointmentTools.prepare_kb,
+    so the cache key matches. Cheap when nothing changed (hash check, no LLM).
+    Blocking; returns how many agents were checked."""
+    import lancedb
+    from database import LANCEDB_PATH
+
+    try:
+        if not os.path.exists(LANCEDB_PATH):
+            return 0
+        rows = lancedb.connect(LANCEDB_PATH).open_table("knowledge").search().select(["agent_id"]).limit(100_000).to_list()
+    except Exception:  # noqa: BLE001 - no KB yet
+        return 0
+    agent_ids = {r.get("agent_id") or None for r in rows}
+    for agent_id in agent_ids:
+        kb_text = load_full_kb(agent_id) or load_kb_text(agent_id)
+        if kb_text:
+            build_profile(agent_id, kb_text)
+    return len(agent_ids)
+
+
 _search_cache = {}
 _search_cache_lock = asyncio.Lock()
 
@@ -198,14 +236,15 @@ async def _cached_search(query: str, agent_id: str | None = None) -> tuple[tuple
 
 
 _SUMMARY_PROMPT = (
-    "Summarise this phone call between Maya (Zryth's voice assistant) and a caller. "
+    "Summarise this phone call between {persona} ({business}'s voice assistant) and a caller. "
     'Return JSON only: {"summary": "2-3 sentences", "intent": "short label, e.g. '
     'product_enquiry / pricing / custom_dev / support / other", "outcome": "one of '
     'lead_captured, consultation_booked, transferred, answered, unresolved, dropped"}.\n\n'
 )
 
 
-async def summarize_transcript(transcript: str, model: str) -> dict | None:
+async def summarize_transcript(transcript: str, model: str, business: str = "the business",
+                               persona: str = "the assistant") -> dict | None:
     """Post-call summary via Gemini. Returns None on any failure."""
     if llm_client is None or not transcript.strip():
         return None
@@ -214,7 +253,7 @@ async def summarize_transcript(transcript: str, model: str) -> dict | None:
             asyncio.to_thread(
                 lambda: llm_client.models.generate_content(
                     model=model,
-                    contents=_SUMMARY_PROMPT + transcript,
+                    contents=_SUMMARY_PROMPT.replace("{persona}", persona).replace("{business}", business) + transcript,
                     config={
                         "response_mime_type": "application/json",
                         "automatic_function_calling": {"disable": True},
@@ -300,9 +339,9 @@ def build_dynamic_tools(tool_specs: list[dict]) -> list:
     return dynamic_tools
 
 
-def _clean_phone(phone: str | None) -> str | None:
-    """Valid ten-digit Indian mobile number, or None (see contact_flow.clean_phone)."""
-    return clean_phone(phone)
+def _clean_phone(phone: str | None, types=("mobile",)) -> str | None:
+    """Valid phone number for these types, or None (see contact_flow.clean_phone)."""
+    return clean_phone(phone, types)
 
 
 # Values the LLM invents when it calls a tool before the caller has said anything.
@@ -359,10 +398,10 @@ def _last_reply_asked(context: RunContext, pattern: str) -> bool:
     return False
 
 
-def _labelled(tool: str, requirement: Optional[str]) -> str:
+def _labelled(tool: str, requirement: Optional[str], booking: str = "consultation") -> str:
     """The calls row has one requirement field for both tools: tag which one it was
-    so the team can tell a callback request from a consultation booking."""
-    label = "[Consultation request]" if tool == "book_consultation" else "[Callback request]"
+    so the team can tell a callback request from a booking ("[Appointment request]")."""
+    label = f"[{booking[:1].upper()}{booking[1:]} request]" if tool == "book_consultation" else "[Callback request]"
     return f"{label} {requirement}" if requirement else label
 
 
@@ -410,6 +449,8 @@ class AppointmentTools:
         self.on_end_requested = None
         # Whole KB for the system prompt (small-KB fast path); None = retrieve per turn.
         self.full_kb: str | None = None
+        # Who we work for (business.py): from the KB, cached; defaults until loaded.
+        self.profile = BusinessProfile.from_dict({"name": config.business_name, "persona": config.persona_name})
         # Number the caller is dialling from (set by the entrypoint).
         self.caller_phone: str | None = None
         # (name, phone) already saved this call -- stops duplicate bookings.
@@ -418,18 +459,44 @@ class AppointmentTools:
         self.known_name: str | None = None
         # Name + phone collection, driven turn by turn from agent.on_user_turn_completed.
         self.contact = ContactFlow()
+        self.set_profile(self.profile)
         # end_call defers once to offer a callback when no details were saved.
         self.callback_offered = False
         # time.monotonic() of the caller's last "hold on" (silence check waits longer).
         self.hold_requested_at: float | None = None
 
+    def set_profile(self, profile: BusinessProfile) -> None:
+        self.profile = profile
+        self.contact.booking = {"en": profile.booking_en, "hi": profile.booking_hi}
+        self.contact.gender = profile.gender
+        self.contact.phone_types = tuple(profile.phone_types)
+
     async def prepare_kb(self) -> None:
-        """Load the KB once per call (local disk, a few ms)."""
+        """Load the KB once per call (local disk, a few ms), and the business profile:
+        from disk when cached, else extracted from the KB in the background (the
+        greeting doesn't need it; the first caller turn does, a few seconds later)."""
         self.full_kb = await asyncio.to_thread(load_full_kb, self.config.org_agent_id)
+        kb_text = self.full_kb or await asyncio.to_thread(load_kb_text, self.config.org_agent_id)
+        cfg = self.config
+        hit = await asyncio.to_thread(cached_profile, cfg.org_agent_id, kb_text, cfg.business_name, cfg.persona_name)
+        if hit:
+            self.set_profile(hit)
+        else:
+            self.profile_task = asyncio.create_task(self._load_profile(kb_text))
         log.info(
             "knowledge mode: %s",
             f"full KB in prompt ({len(self.full_kb)} chars)" if self.full_kb else "per-turn retrieval",
         )
+
+    def clean_caller(self) -> str | None:
+        """The caller's own number, if it's one this business accepts for callbacks."""
+        return clean_phone(self.caller_phone, self.contact.phone_types)
+
+    async def _load_profile(self, kb_text: str | None) -> None:
+        cfg = self.config
+        self.set_profile(await asyncio.to_thread(
+            build_profile, cfg.org_agent_id, kb_text, cfg.business_name, cfg.persona_name
+        ))
 
     def to_tools(self) -> list:
         tools = [self.capture_lead, self.book_consultation, self.end_call]
@@ -472,7 +539,7 @@ class AppointmentTools:
         contact flow (contact_flow.py). Returns the first question as a speak() line,
         which agent.llm_node says word for word."""
         lang = getattr(context.session.current_agent, "code", "en")
-        caller = _clean_phone(self.caller_phone)
+        caller = self.clean_caller()
         if self.saved_contact is not None:
             log.info("%s: details already saved this call", tool)
             return None
@@ -500,7 +567,7 @@ class AppointmentTools:
     async def finish_contact(self, lang: str) -> str:
         """Save the confirmed name + number; returns the line to speak."""
         flow = self.contact
-        name, phone = flow.name or self.known_name or "", flow.phone or _clean_phone(self.caller_phone) or ""
+        name, phone = flow.name or self.known_name or "", flow.phone or self.clean_caller() or ""
         if self.call_id and (name or phone):
             try:
                 await asyncio.to_thread(
@@ -508,14 +575,14 @@ class AppointmentTools:
                     call_id=self.call_id,
                     customer_name=name,
                     phone=phone,
-                    requirement=_labelled(flow.tool, flow.requirement),
+                    requirement=_labelled(flow.tool, flow.requirement, self.profile.booking_en),
                 )
             except Exception:
                 log.exception("Saving contact details failed")
         self.saved_contact = (name, phone)
         self.known_name = name
         log.info("%s -> %s (%s) saved", flow.tool, name, phone)
-        text = flow.saved_text(lang, self.config.business_name)
+        text = flow.saved_text(lang, self.profile.name)
         flow.reset()
         return text
 
@@ -534,7 +601,7 @@ class AppointmentTools:
         Pure small talk ("hello", "okay") is skipped. Questions whose best match
         is weak are logged as knowledge gaps.
         """
-        text = normalise_names((text or "").strip())
+        text = normalise_names((text or "").strip(), self.profile.aliases)
         if not text or SMALL_TALK.match(text):
             return tuple()
         t0 = time.perf_counter()
@@ -568,10 +635,12 @@ class AppointmentTools:
         preferred_time: Optional[str] = None,
         name: Optional[str] = None,
     ) -> str | None:
-        """Book a consultation / demo / meeting with the team.
+        """Book whatever this business offers: an appointment, consultation, demo, site visit,
+        class, reservation or meeting.
 
-        Call it IMMEDIATELY when the caller asks for a meeting, call or demo, or
-        agrees when you offer one ("yes", "book it", "demo मिल सकता है?"); otherwise
+        Call it IMMEDIATELY when the caller asks to book one (an appointment, a visit,
+        a demo, a table...), or agrees when you offer one ("yes", "book it",
+        "appointment मिल सकता है?"); otherwise
         use `capture_lead`. Do NOT first ask for a date, time or name: pass a date
         or time only if the caller already said one.
         Do NOT ask for their name or number yourself: this tool asks for the name,
@@ -755,7 +824,7 @@ class AppointmentTools:
 
 if __name__ == "__main__":
     print("tools.py self-check passed")
-    print("Zryth tools available:")
+    print("Tools available:")
     print("- capture_lead")
     print("- book_consultation")
     print("- transfer_to_human")

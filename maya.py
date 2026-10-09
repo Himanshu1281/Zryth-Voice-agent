@@ -19,11 +19,12 @@ import time
 from livekit import agents
 from livekit.agents import Agent, RunContext, function_tool
 
+from business import gendered
 from config import BCP47, SUPPORTED_LANGUAGES
-from contact_flow import clean_phone as _clean_phone, extract_digits, name_from_history
+from contact_flow import extract_digits, name_from_history
 from database import update_call_lead
 from intents import (
-    ACCEPT, ALREADY_TOLD, BOOKING_WORDS, CALLBACK_WORDS, CLEAR_GOODBYE, HOLD, HUMAN, NO, NOT_A_YES, OFFER,
+    ACCEPT, ALREADY_TOLD, BOOKING_WORDS, CALLBACK_WORDS, CLEAR_GOODBYE, EMERGENCY, HOLD, HUMAN, INTERESTED, NO, NOT_A_YES, OFFER,
     OFFICE_HOURS, QUESTION, SAME, TALK, TIME_OR_DATE, TOPIC, UNKNOWN_FACT, WANT, WHERE, YES,
 )
 from language import (
@@ -32,9 +33,10 @@ from language import (
 )
 from prompts import LANG_NAMES, STYLE_NOTES, build_instructions
 from replies import (
-    CALLBACK_OFFER, EMPTY_REPLY_FALLBACK, FILLERS, GENERIC_TOOL_FALLBACK, LENGTH_RULE, MARKDOWN,
+    CALLBACK_OFFER, EMERGENCY_LINE, EMERGENCY_REPEAT, EMPTY_REPLY_FALLBACK, FILLERS, GENERIC_TOOL_FALLBACK, LENGTH_RULE, MARKDOWN,
     MAX_REPLY_SENTENCES, MIN_SENTENCE_WORDS, NO_TRANSFER, OFFICE_ADDRESS, OFFICE_HOURS_ASK, OFFICE_HOURS_SAVED,
-    META_ASIDE, META_LOOKAHEAD, SAY_MARKER, SENTENCE_END, TOOL_REPLY_FALLBACK, office_address, repeats_earlier,
+    JARGON_HOLD_WORDS, META_ASIDE, META_LOOKAHEAD, SAY_MARKER, SENTENCE_END, TOOL_REPLY_FALLBACK, office_address,
+    repeats_earlier, scrub_jargon,
 )
 from routing import CallConfig
 from tools import AppointmentTools
@@ -55,9 +57,12 @@ def compose_instructions(code: str, caller_phone: str | None, kb: "AppointmentTo
     """Persona + language rules, then the whole KB (small-KB fast path), then the
     per-call caller line last so the long stable prefix stays cacheable."""
     cfg = kb.config if kb is not None else CallConfig()
-    text = build_instructions(code, STYLE_NOTES[code], business=cfg.business_name, persona=cfg.persona_name)
+    profile = kb.profile if kb is not None else None
+    text = build_instructions(code, STYLE_NOTES[code], business=cfg.business_name, persona=cfg.persona_name,
+                              profile=profile)
+    business = profile.name if profile is not None else cfg.business_name
     if kb is not None and kb.full_kb:
-        text += f"\n\nRelevant {cfg.business_name} knowledge (the ONLY source of facts):\n" + kb.full_kb
+        text += f"\n\nRelevant {business} knowledge (the ONLY source of facts):\n" + kb.full_kb
     return _with_caller(text, caller_phone)
 
 
@@ -109,7 +114,7 @@ class BaseMayaAgent(Agent):
                 if (m := META_ASIDE.search(tail)):
                     tail, muted = tail[: m.start()], True
                 continue
-            buf = held + text
+            buf = scrub_jargon(held + text)
             if (m := META_ASIDE.search(buf)):
                 # "...सकती।\n\n(If the caller is done, call `end_call`...)": Gemini copies
                 # the "(...)" reminders we tag onto the caller's message. Never speak it.
@@ -130,6 +135,13 @@ class BaseMayaAgent(Agent):
             # Emit up to the last whitespace; hold the tail until we know whether
             # its "." / "?" ends a sentence (needs the following space).
             split = max(buf.rfind(" "), buf.rfind("\n")) + 1
+            # Also hold the last few words: "The knowledge" + " base does not..." must
+            # reach scrub_jargon together.
+            spaces = [i for i, c in enumerate(buf) if c in " \n"]
+            if len(spaces) >= JARGON_HOLD_WORDS:
+                split = min(split, spaces[-JARGON_HOLD_WORDS] + 1)
+            else:
+                split = 0
             paren = buf.rfind("(")
             if paren != -1 and ")" not in buf[paren:] and len(buf) - paren < META_LOOKAHEAD:
                 # An open "(" may be the start of an instruction-like aside: hold it
@@ -146,7 +158,7 @@ class BaseMayaAgent(Agent):
             return
         # One more sentence at most. If the model went on longer, keep its closing
         # question ("Would you like to know more?"), which moves the call forward.
-        rest = [s for s in re.split(r"(?<=[.!?।])\s+", tail.strip()) if s.strip()]
+        rest = [s for s in re.split(r"(?<=[.!?।])\s+", scrub_jargon(tail).strip()) if s.strip()]
         if len(rest) > 1:
             log.info("reply capped at %d sentences (dropped %d)", MAX_REPLY_SENTENCES, len(rest) - 1)
             last = rest[-1]
@@ -188,6 +200,7 @@ class BaseMayaAgent(Agent):
         )
         if self.kb is not None and last_msg is not None and last_msg.id not in self._seen_user_ids():
             self._seen_user_ids().add(last_msg.id)
+            await self._apply_profile()
             self._typed_turn = True
             try:
                 await self._code_turn(chat_ctx, last_msg, last_msg.text_content or "")
@@ -219,7 +232,7 @@ class BaseMayaAgent(Agent):
 
         # Caller declined or said "nahi" / "no":
         if NO.search(last_user) and len(last_user.split()) <= 4:
-            nudges.append("The caller said no/declined. Do NOT ask for company or workflow details again. Say 'No problem!' and ask what questions they have about Zryth or offer a consultation.")
+            nudges.append("The caller said no/declined. Do NOT ask the same question again. Say 'No problem!' and ask what questions they have, or offer " + (self.kb.profile.offer(self.code) if self.kb else "help") + ".")
 
         # Facts callers often ask about that aren't in the knowledge: the TRUTH prompt
         # rule alone didn't stop "रविवार को हमारा ऑफिस बंद रहता है".
@@ -237,8 +250,12 @@ class BaseMayaAgent(Agent):
                 chat_ctx.items[i] = m.model_copy(update={"content": [*m.content, f"\n\n({nudge_text})"]})
                 break
         regens = 0  # wrong-language / repeated replies thrown away this turn (max 2)
+        lang_regens = 0
         for attempt in range(3):
             produced = False
+            # Third try after two wrong-language replies: hold the whole reply and
+            # translate it if it's still wrong ("price बताइए ना" got English 3 times).
+            translate_last = regens >= 2 and lang_regens >= 2
             # Hold the first few words back until we know the reply's language:
             # Gemini sometimes copies an earlier English answer to a Hindi question.
             pending: list = []
@@ -257,6 +274,11 @@ class BaseMayaAgent(Agent):
                         text = chunk.delta.content or ""
                         has_tool = bool(chunk.delta.tool_calls)
                     produced = produced or bool(text.strip() or has_tool)
+                    if translate_last and not has_tool:
+                        pending.append(chunk)
+                        head += text
+                        continue
+                    translate_last = False
                     if not checking or has_tool:
                         checking = False
                         for p in pending:
@@ -300,6 +322,7 @@ class BaseMayaAgent(Agent):
                 # Up to two tries: one regeneration alone still came back in English
                 # sometimes ("Got it. We can help you automate..." to a Hindi caller).
                 regens += 1
+                lang_regens += 1
                 log.warning("LLM replied in the wrong language (%r...); regenerating in %s", head[:40], self.code)
                 chat_ctx = chat_ctx.copy()
                 chat_ctx.add_message(
@@ -307,6 +330,12 @@ class BaseMayaAgent(Agent):
                     content=RETRY_IN_LANGUAGE.get(self.code, RETRY_IN_LANGUAGE["en"]),
                 )
                 continue
+            if translate_last and head.strip() and wrong_language(head, self.code):
+                log.warning("LLM still in the wrong language after 2 retries; translating to %s", self.code)
+                translated = await self._translate(head, model_settings)
+                if translated:
+                    yield translated
+                    return
             for p in pending:  # short reply that ended before the check
                 yield p
             if produced:
@@ -336,10 +365,24 @@ class BaseMayaAgent(Agent):
         async for frame in Agent.default.tts_node(self, _clean(text), model_settings):
             yield frame
 
+    async def _apply_profile(self) -> None:
+        """When the business profile finished loading in the background (first call
+        after a KB change), rebuild the prompt with it. Waits at most 3 s for it."""
+        if self.kb is None:
+            return
+        task = getattr(self.kb, "profile_task", None)
+        if task is not None and not task.done():
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(asyncio.shield(task), 3)
+        if getattr(self, "_profile_used", None) is not self.kb.profile:
+            self._profile_used = self.kb.profile
+            await self.update_instructions(compose_instructions(self.code, self.caller_phone, self.kb))
+
     async def on_user_turn_completed(
         self, turn_ctx: agents.llm.ChatContext, new_message: agents.llm.ChatMessage
     ) -> None:
         """Inject the agent's relevant knowledge so the LLM answers in ONE round trip."""
+        await self._apply_profile()
         text = new_message.text_content or ""
         self._seen_user_ids().add(new_message.id)  # llm_node must not handle it again
         if self.kb is not None and HOLD.search(text):
@@ -369,7 +412,8 @@ class BaseMayaAgent(Agent):
                 log.info("Ignoring transcript in an unsupported script %r (%.2f)", text, conf)
                 raise agents.StopResponse()
             log.info("Caller spoke an unsupported language: %r", text)
-            self.session.say(UNSUPPORTED_LANGUAGE.get(self.code, UNSUPPORTED_LANGUAGE["en"]))
+            self.session.say(gendered(UNSUPPORTED_LANGUAGE.get(self.code, UNSUPPORTED_LANGUAGE["en"]),
+                                      self.kb.profile.gender if self.kb else "female"))
             raise agents.StopResponse()
         lang = detect_language(text)
         if lang and lang != self.code:
@@ -435,20 +479,34 @@ class BaseMayaAgent(Agent):
             # "okay fine, bye" while we ask for a name/number: they're leaving.
             self.kb.contact.reset()
             self._reply_by_code(new_message, goodbye=True)
+        number = self.kb.profile.emergency_number or "112"
+        if EMERGENCY.search(text):
+            # "सीने में दर्द है, साँस नहीं ले पा रहे": help first. No booking, no pitch.
+            self.kb.contact.reset()
+            self.kb.emergency = True
+            self._reply_by_code(new_message, EMERGENCY_LINE.get(self.code, EMERGENCY_LINE["en"]).format(number=number))
+        if (
+            getattr(self.kb, "emergency", False) and len(text.split()) <= 4 and "?" not in text
+            and not QUESTION.search(text) and not WHERE.search(text)
+        ):
+            # "अच्छा ठीक है" after the emergency line: Gemini asked "since when is the
+            # pain?". Keep pointing them to the emergency number instead.
+            self._reply_by_code(new_message, EMERGENCY_REPEAT.get(self.code, EMERGENCY_REPEAT["en"]).format(number=number))
         if self.kb.contact.active:
             await self._contact_turn(turn_ctx, new_message, text)
-        elif OFFICE_HOURS.search(text):
-            # Office timings / visits aren't in the knowledge (Gemini invented "closed on
-            # Sunday"): the team confirms them by phone, so take the details.
+        elif OFFICE_HOURS.search(text) and not self.kb.profile.hours:
+            # Timings / visits that the knowledge doesn't cover (Gemini invented "closed on
+            # Sunday"): the team confirms them by phone, so take the details. When the KB
+            # does list timings, the LLM answers from it instead.
             if self.kb.saved_contact is not None:
                 self._reply_by_code(new_message, OFFICE_HOURS_SAVED.get(self.code, OFFICE_HOURS_SAVED["en"]))
             line = self.kb.contact.start(
                 "capture_lead", f"Office hours / visit: {text.strip()}"[:300],
                 getattr(self.kb, "known_name", None) or name_from_history(self._user_texts(turn_ctx, new_message)),
-                self.code, _clean_phone(self.kb.caller_phone), opener=False,
+                self.code, self.kb.clean_caller(), opener=False,
             )
             # "आपका office कहाँ है? मैं मिलने आना चाहता हूँ": answer the where first.
-            address = office_address(self.kb.full_kb) if WHERE.search(text) else None
+            address = (self.kb.profile.address or office_address(self.kb.full_kb)) if WHERE.search(text) else None
             where = OFFICE_ADDRESS.get(self.code, OFFICE_ADDRESS["en"]).format(address=address) if address else ""
             self._reply_by_code(new_message, where + OFFICE_HOURS_ASK.get(self.code, OFFICE_HOURS_ASK["en"]) + line)
         elif self._no_streak >= 2:
@@ -476,6 +534,31 @@ class BaseMayaAgent(Agent):
         elif self.kb.saved_contact is None:
             self._maybe_start_contact(turn_ctx, new_message, text)
 
+    async def _translate(self, text: str, model_settings) -> str | None:
+        """The reply in the caller's language (last resort of the wrong-language guard)."""
+        ctx = agents.llm.ChatContext.empty()
+        ctx.add_message(
+            role="user",
+            content=(
+                f"Translate this phone reply into natural spoken {LANG_NAMES[self.code]}"
+                + (" in Devanagari script (keep product names in English)" if self.code == "hi" else "")
+                + f". Output only the translation.\n\n{text.strip()}"
+            ),
+        )
+        out = ""
+        try:
+            async with contextlib.aclosing(Agent.default.llm_node(self, ctx, [], model_settings)) as stream:
+                async for chunk in stream:
+                    if isinstance(chunk, str):
+                        out += chunk
+                    elif getattr(chunk, "delta", None) is not None:
+                        out += chunk.delta.content or ""
+        except Exception:  # noqa: BLE001 - the original reply is better than silence
+            log.exception("translation failed")
+            return None
+        out = out.strip()
+        return out if out and not wrong_language(out, self.code) else None
+
     def _reply_by_code(
         self, new_message: agents.llm.ChatMessage, line: str | None = None, goodbye: bool = False
     ) -> None:
@@ -483,12 +566,12 @@ class BaseMayaAgent(Agent):
         Spoken turns: keep the caller's message and stop the LLM. Typed turns (console)
         come through llm_node instead, which catches _CodeReply and outputs the line."""
         if getattr(self, "_typed_turn", False):
-            raise _CodeReply(line, goodbye)
+            raise _CodeReply(gendered(line, self.kb.profile.gender) if line else line, goodbye)
         self._keep_user_turn(new_message)
         if goodbye:
             self.kb.say_goodbye(self.session, self.code)
         else:
-            self.session.say(line)
+            self.session.say(gendered(line, self.kb.profile.gender))
         raise agents.StopResponse()
 
     @staticmethod
@@ -527,7 +610,12 @@ class BaseMayaAgent(Agent):
              if getattr(m, "role", None) == "assistant" and m.text_content),
             "",
         )
-        asked = bool(BOOKING_WORDS.search(text) and WANT.search(text)) or bool(CALLBACK_WORDS.search(text))
+        own = self.kb.profile.booking_regex  # this business's words: "checkup", "site visit", "टेबल"
+        books = lambda t: bool(BOOKING_WORDS.search(t) or (own and own.search(t)))  # noqa: E731
+        asked = (
+            bool(books(text) and WANT.search(text)) or bool(CALLBACK_WORDS.search(text))
+            or bool(INTERESTED.search(text.strip()))
+        )
         # "Okay thanks, bye" after an offer is a goodbye, not a yes.
         accepted = (
             bool(OFFER.search(last_reply)) and "?" in last_reply
@@ -545,12 +633,12 @@ class BaseMayaAgent(Agent):
         # team call you back?") -> lead.
         if wants_human:
             booking = False
-        elif BOOKING_WORDS.search(text):
+        elif books(text):
             booking = True
         elif CALLBACK_WORDS.search(text):
             booking = False
         else:
-            booking = bool(BOOKING_WORDS.search(last_reply))
+            booking = books(last_reply)
         tool = "book_consultation" if booking else "capture_lead"
         recent = [
             m.text_content for m in turn_ctx.items
@@ -568,7 +656,7 @@ class BaseMayaAgent(Agent):
         )
         log.info("%s started from code (asked=%s, accepted offer=%s, human=%s, name=%s)", tool, asked, accepted, wants_human, known_name)
         line = self.kb.contact.start(
-            tool, requirement, known_name, self.code, _clean_phone(self.kb.caller_phone), opener=not wants_human
+            tool, requirement, known_name, self.code, self.kb.clean_caller(), opener=not wants_human
         )
         if wants_human:
             line = NO_TRANSFER.get(self.code, NO_TRANSFER["en"]) + line
@@ -580,7 +668,7 @@ class BaseMayaAgent(Agent):
         """One caller turn while taking name + number. Speaks the flow's line and
         stops the LLM, or (caller asked something else) lets the LLM answer and re-ask."""
         kb = self.kb
-        caller = _clean_phone(kb.caller_phone)
+        caller = kb.clean_caller()
         if kb.contact.stage == "name" and not kb.contact.name and ALREADY_TOLD.search(text):
             # "abhi tho bola": they gave it to the LLM earlier; find it instead of re-asking.
             kb.contact.name = kb.known_name or name_from_history(self._user_texts(turn_ctx, new_message))
@@ -620,7 +708,8 @@ class BaseMayaAgent(Agent):
         options = FILLERS.get(self.code, FILLERS["en"])
         self._filler_i = (getattr(self, "_filler_i", -1) + 1) % len(options)
         try:
-            self.session.say(options[self._filler_i], add_to_chat_ctx=False)
+            self.session.say(gendered(options[self._filler_i], self.kb.profile.gender if self.kb else "female"),
+                             add_to_chat_ctx=False)
         except Exception:
             log.exception("filler failed")
 

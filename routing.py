@@ -32,7 +32,7 @@ class CallConfig:
     template_id: str = DEFAULT_TEMPLATE_ID
     org_id: str | None = None
     org_agent_id: str | None = None      # None = no org agent (knowledge rows without agent_id)
-    business_name: str = "Zryth"
+    business_name: str = "our company"  # real name comes from the org agent row
     persona_name: str = "Maya"
     greeting: str | None = None          # None = template greeting
     transfer_number: str | None = DEFAULT_TRANSFER_NUMBER

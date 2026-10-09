@@ -1,0 +1,13 @@
+{
+  "_comment": "Zryth (default org agent). Manual fixes on top of the profile extracted from the KB. Any key of business.BusinessProfile can be set here; aliases map a speech-to-text mishearing (regex) to the brand name.",
+  "booking_en": "consultation",
+  "booking_hi": "consultation",
+  "offer_en": "a free consultation",
+  "offer_hi": "एक मुफ़्त consultation",
+  "aliases": {
+    "(?:उस ?वाले?|ओ[सस्]+वाल|एशो)\\s+(?:ए\\s?आई|एआई|ऐसे|आए|ए|AI|oil)(?=[\\s।.?!,]|$)": "Oswaal AI",
+    "ओस्?वाल": "Oswaal",
+    "\\b(?:oswal|oswall|osval|oswaal)\\b": "Oswaal",
+    "\\b(?:zyrth|zrith|zerith|zirith|zirth|zerth|zareth|zarith|zarid|zerid|zaret)\\b": "Zryth"
+  }
+}

@@ -89,6 +89,19 @@ def office_address(kb_text: str | None) -> str | None:
     return m.group(1).strip(" .") if m else None
 
 
+# A caller in an emergency: help first, nothing else ({number}: the business's own
+# emergency line from the KB, else 112).
+EMERGENCY_LINE: dict[str, str] = {
+    "en": "This sounds like an emergency. Please call {number} right away for immediate help.",
+    "hi": "यह इमरजेंसी लग रही है। कृपया तुरंत {number} पर कॉल करें।",
+}
+
+# Any later turn of an emergency call that isn't a question: the number again.
+EMERGENCY_REPEAT: dict[str, str] = {
+    "en": "Please call {number} now, they can help you right away. Take care.",
+    "hi": "कृपया अभी {number} पर कॉल करें, वहाँ तुरंत मदद मिलेगी। अपना ध्यान रखिए।",
+}
+
 OFFICE_HOURS_SAVED: dict[str, str] = {
     "en": "Our team will call you back about the office timings.",
     "hi": "ऑफिस की टाइमिंग के बारे में हमारी टीम आपको वापस कॉल करेगी।",
@@ -105,6 +118,29 @@ META_ASIDE = re.compile(
 )
 # How far past an open "(" we wait before deciding it's an ordinary aside.
 META_LOOKAHEAD = 80
+
+
+# Internal words the prompt uses that a caller should never hear ("The knowledge base
+# does not contain information about monthly maintenance charges.").
+JARGON: list = [
+    (re.compile(r"\b(?:the |my |our )?knowledge(?: base)? (?:does not|doesn't|did not) (?:contain|have|mention|include|say)"
+                r"(?: any)?(?: specific)? (?:information|details|info)(?: (?:about|on|regarding))?", re.I),
+     "I don't have the details on"),
+    # "According to the knowledge base, we open at 9." -> "We open at 9."
+    (re.compile(r"\b(?:in|from|according to|based on) (?:the|my|our) knowledge(?: base)?,?\s*([a-z]?)", re.I),
+     lambda m: m.group(1).upper()),
+    (re.compile(r"\b(?:the|my|our) knowledge base\b", re.I), "my information"),
+    (re.compile(r"नॉलेज\s*बेस में|knowledge base में"), "मेरी जानकारी में"),
+    (re.compile(r"नॉलेज\s*बेस|knowledge base"), "जानकारी"),
+]
+# Words held back while streaming, so a phrase split across chunks is still caught.
+JARGON_HOLD_WORDS = 4
+
+
+def scrub_jargon(text: str) -> str:
+    for pat, repl in JARGON:
+        text = pat.sub(repl, text)
+    return text
 
 
 def repeats_earlier(head: str, replies: list[str]) -> bool:

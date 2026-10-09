@@ -79,7 +79,6 @@ from config import (
     USER_AWAY_TIMEOUT_S,
 )
 from prompts import greeting
-from contact_flow import clean_phone as _clean_phone
 from maya import GreeterAgent
 from replies import NUMBER_NOT_ACTIVE
 from routing import CallConfig, resolve_call_config
@@ -333,6 +332,9 @@ async def entrypoint(ctx: JobContext) -> None:
         config,
     )
     await tools_instance.prepare_kb()
+    if not config.greeting and dynamic_greeting == default_greeting:
+        # No custom/template greeting: use the business profile's (persona's Hindi name, gender).
+        dynamic_greeting = greeting(config.language, profile=tools_instance.profile)
     session.on(
         "metrics_collected",
         _make_metrics_handler(ctx.room.name),
@@ -394,7 +396,8 @@ async def entrypoint(ctx: JobContext) -> None:
             text = getattr(item, "text_content", None)
             if role in ("user", "assistant") and text:
                 lines.append(f"{'Caller' if role == 'user' else 'Maya'}: {text}")
-        result = await summarize_transcript("\n".join(lines), LLM_MODEL)
+        result = await summarize_transcript("\n".join(lines), LLM_MODEL,
+                                            tools_instance.profile.name, tools_instance.profile.persona)
         if result:
             try:
                 await asyncio.to_thread(
@@ -409,7 +412,7 @@ async def entrypoint(ctx: JobContext) -> None:
 
         # Fallback for dashboard: ensure lead details are recorded
         final_name = getattr(tools_instance, "known_name", None) or tools_instance.contact.name
-        final_phone = tools_instance.contact.phone or _clean_phone(tools_instance.caller_phone)
+        final_phone = tools_instance.contact.phone or tools_instance.clean_caller()
         if final_name or final_phone:
             try:
                 await asyncio.to_thread(
@@ -582,6 +585,21 @@ if __name__ == "__main__":
 
         t2 = threading.Thread(target=realtime_sync_worker, daemon=True)
         t2.start()
+
+        def profile_warmer():
+            # Business profiles for every agent, rebuilt only when a KB changes, so the
+            # first call after a KB update never waits for one (business.py).
+            from tools import warm_profiles
+
+            while True:
+                try:
+                    warm_profiles()
+                except Exception:  # noqa: BLE001 - retried next round
+                    log.exception("profile warm-up failed")
+                time.sleep(120)
+
+        t3 = threading.Thread(target=profile_warmer, daemon=True)
+        t3.start()
 
     try:
         agents.cli.run_app(

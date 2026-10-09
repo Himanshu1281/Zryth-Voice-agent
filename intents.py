@@ -90,7 +90,11 @@ TIME_OR_DATE = re.compile(
 
 # ---- Wanting to be contacted: bookings, callbacks, a person --------------------
 BOOKING_WORDS = re.compile(
-    r"\b(?:demo|consultation|meeting|appointment)\b|डेमो|कंसल्टेशन|मीटिंग|अपॉइंटमेंट|बुक|\bbook",
+    # Generic across businesses; each business adds its own words via BusinessProfile.booking_words.
+    r"\b(?:demo|consultation|meeting|appointment|reservation|booking|slot|site visit|trial class|demo class|"
+    # clinics / hospitals: "cardiologist ko dikhana hai", "doctor se milna hai"
+    r"doctor|dr|opd|specialist|\w+ologist|checkup|check-up)\b"
+    r"|डेमो|कंसल्टेशन|मीटिंग|अपॉइंटमेंट|बुकिंग|रिज़र्वेशन|रिजर्वेशन|साइट विज़िट|बुक|\bbook|डॉक्टर|ओपीडी|चेकअप",
     re.I,
 )
 
@@ -104,8 +108,22 @@ CALLBACK_WORDS = re.compile(
 )
 
 WANT = re.compile(
-    r"\b(?:want|need|like|book|schedule|can i|could i|i'd|please|get)\b"
-    r"|चाहिए|चाहता|चाहती|मिल सकता|मिल सकती|मिलेगा|मिलेगी|करवा|करा|कर दो|कर दीजिए|कीजिए|बुक",
+    r"\b(?:want|need|like|book|schedule|can i|could i|i'd|please|get|"
+    # Romanized Hindi ("appointment chahiye", "milna hai"): a dental parent's booking was missed.
+    r"chahiye|chahta|chahti|milega|milegi|mil sakta|mil sakti|karwana|karna hai|kar do|kar dijiye|milna hai|"
+    r"dikhana|dikhana hai|dikhwana)\b"
+    r"|चाहिए|चाहता|चाहती|मिल सकता|मिल सकती|मिलेगा|मिलेगी|करवा|करा|कर दो|कर दीजिए|कीजिए|बुक|मिलना है|दिखाना|दिखवाना",
+    re.I,
+)
+
+# "I'm interested" / "interested hoon": a clear yes to the product, even without an
+# offer just before it (the LLM kept pitching and never took the details).
+INTERESTED = re.compile(
+    r"^(?:(?:ok(?:ay)?|yes|great|nice|good|(?:that )?sounds (?:useful|good|great))[,.!]?\s*)*"
+    r"(?:i'?m|i am|we'?re|we are|main|hum)\s+(?:very |really |definitely )?interested"
+    r"(?:\s+(?:hoon|hu|hain|hai|in (?:it|this|that|the \w+)))?[\s.!]*$"
+    r"|^(?:मुझे|हमें)\s+(?:इसमें\s+)?(?:रुचि|इंटरेस्ट)\s+है[\s।!]*$"
+    r"|^(?:मैं)\s+(?:इंटरेस्टेड|interested)\s+(?:हूँ|हूं)",
     re.I,
 )
 
@@ -240,16 +258,32 @@ UNKNOWN_FACT = re.compile(
 OFFICE_HOURS = re.compile(
     r"\b(?:office (?:hours|timings?)|timings?|opening hours|working hours|open on|closed on|"
     r"(?:open|closed) (?:on )?(?:sunday|saturday|today|tomorrow)|when (?:are you|is the office) open|"
-    r"kab khula|kab band|milne aa|"
+    r"kab khula|kab band|milne aa|kitne baje|khul(?:ta|ti|te) hai|kab khul(?:ta|ti|te)|band (?:hota|rehta|rehti)|"
     # Visiting: "I'd like to visit you", "can I come and meet you", "drop by your office"
-    r"visit (?:you|your|the|us|zryth)|come (?:to|and|over|by)\b.{0,20}(?:office|meet|see|visit)|"
+    # Visiting the office ("visit you", "visit your office"); "visit the site" is a booking.
+    r"visit (?:you|us|your (?:office|shop|clinic|store)|the office)|come (?:to|and|over|by)\b.{0,20}(?:office|meet|see|visit)|"
     r"meet (?:you|the team) (?:in person|at)|drop by|walk in)\b"
-    r"|कब खुला|कब बंद|खुला रहता|बंद रहता|टाइमिंग|ऑफिस.*(?:आ सकता|आ सकती|मिलने|खुला|बंद)|मिलने आ",
+    r"|कब खुला|कब बंद|खुला रहता|बंद रहता|टाइमिंग|ऑफिस.*(?:आ सकता|आ सकती|मिलने|खुला|बंद)|मिलने आ|"
+    r"कितने बजे|खुलता है|खुलती है|खुलते हैं|कब खुलता|कब खुलती",
     re.I,
 )
 
 # The caller also asked where the office is.
 WHERE = re.compile(r"\b(?:where|address|location|kahan|kaha|pata)\b|कहाँ|कहां|पता|लोकेशन|एड्रेस", re.I)
+
+
+# ---- Emergencies -----------------------------------------------------------------
+# A caller describing a medical / safety emergency: tell them to call for help now,
+# never start a booking (maya.py). Ordinary pain ("दाँत में दर्द") is not one.
+EMERGENCY = re.compile(
+    r"\b(?:chest pain|heart attack|can'?t breathe|cannot breathe|not breathing|stopped breathing|"
+    r"unconscious|fainted|collapsed|heavy bleeding|bleeding (?:a lot|heavily|badly)|stroke|seizure|fits|"
+    r"(?:had|met with) an accident|accident (?:ho gaya|hua hai|hua)|on fire|fire in|poison(?:ed|ing)?|"
+    r"overdose|suicid\w*|seene (?:mein|me) dard|saans nahi|behosh|khoon beh)\b"
+    r"|सीने में (?:बहुत )?दर्द|सीने में जलन और|दिल का दौरा|हार्ट अटैक|साँस नहीं|सांस नहीं|बेहोश|"
+    r"खून बह|एक्सीडेंट हो गया|एक्सीडेंट हुआ|दुर्घटना हो|आग लग|ज़हर खा|जहर खा|दौरा पड़",
+    re.I,
+)
 
 
 # ---- Other ---------------------------------------------------------------------

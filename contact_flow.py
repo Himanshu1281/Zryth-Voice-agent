@@ -20,6 +20,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
+from business import gendered
 from intents import (
     ALREADY_TOLD, DIFFERENT, NO, NOT_A_NAME, NOT_A_YES, REFUSE, SAME, TIME_OR_DATE, YES,
 )
@@ -41,12 +42,14 @@ TEXTS: dict[str, dict[str, str]] = {
         "ask_rest": "Okay, {got}. Could you tell me the remaining {n} digit{s}?",
         "too_many": "Sorry, I got more than ten digits. Could you say your ten-digit number again from the start?",
         "invalid": "Sorry, I can only take a ten-digit Indian mobile number, starting with 6, 7, 8 or 9. Could you say it again?",
+        "invalid_landline": "Sorry, that doesn't look like a valid number. Could you tell me a ten-digit mobile number, or a landline with its STD code?",
+        "invalid_intl": "Sorry, that doesn't look like a valid number. Could you say it again? For a number outside India, start with the country code.",
         "skip_number": "No problem, let's leave the number for now. Is there anything else I can help you with?",
         "confirm": "Just to confirm, your number is {spoken}. Is that correct?",
         "confirm_again": "Sorry, is {spoken} the right number? Please say yes or no.",
         "retry_digits": "No problem. Could you tell me the full ten-digit number again?",
         "saved_lead": "Thank you, {name}! Your details are saved and the {business} team will contact you soon. Is there anything else I can help you with?",
-        "saved_booking": "Thank you, {name}! Your consultation request is booked and the {business} team will contact you soon. Is there anything else I can help you with?",
+        "saved_booking": "Thank you, {name}! Your {booking} request is booked and the {business} team will contact you soon. Is there anything else I can help you with?",
     },
     "hi": {
         "ask_name": "क्या मैं आपका नाम जान सकती हूँ?",
@@ -64,12 +67,14 @@ TEXTS: dict[str, dict[str, str]] = {
         "ask_rest": "ठीक है, {got}। क्या आप बाकी के {n} अंक बता सकते हैं?",
         "too_many": "माफ़ कीजिए, मुझे दस से ज़्यादा अंक मिले। क्या आप अपना दस अंकों का नंबर शुरू से दोबारा बता सकते हैं?",
         "invalid": "माफ़ कीजिए, मैं सिर्फ़ दस अंकों का भारतीय मोबाइल नंबर ले सकती हूँ, जो 6, 7, 8 या 9 से शुरू हो। क्या आप दोबारा बता सकते हैं?",
+        "invalid_landline": "माफ़ कीजिए, यह नंबर सही नहीं लग रहा। क्या आप दस अंकों का मोबाइल नंबर, या STD कोड के साथ लैंडलाइन नंबर बता सकते हैं?",
+        "invalid_intl": "माफ़ कीजिए, यह नंबर सही नहीं लग रहा। क्या आप दोबारा बता सकते हैं? भारत के बाहर का नंबर हो तो country code से शुरू करें।",
         "skip_number": "कोई बात नहीं, नंबर अभी रहने देते हैं। क्या मैं आपकी और किसी चीज़ में मदद कर सकती हूँ?",
         "confirm": "एक बार कन्फ़र्म कर लूँ, आपका नंबर है {spoken}। क्या यह सही है?",
         "confirm_again": "माफ़ कीजिए, क्या {spoken} सही नंबर है? कृपया हाँ या ना बताइए।",
         "retry_digits": "कोई बात नहीं। क्या आप पूरा दस अंकों का नंबर दोबारा बता सकते हैं?",
         "saved_lead": "धन्यवाद {name} जी! आपकी जानकारी सेव हो गई है, {business} की टीम जल्द ही आपसे संपर्क करेगी। क्या मैं आपकी और किसी चीज़ में मदद कर सकती हूँ?",
-        "saved_booking": "धन्यवाद {name} जी! आपकी consultation request दर्ज हो गई है, {business} की टीम जल्द ही आपसे संपर्क करेगी। क्या मैं आपकी और किसी चीज़ में मदद कर सकती हूँ?",
+        "saved_booking": "धन्यवाद {name} जी! आपकी {booking} request दर्ज हो गई है, {business} की टीम जल्द ही आपसे संपर्क करेगी। क्या मैं आपकी और किसी चीज़ में मदद कर सकती हूँ?",
     },
 }
 
@@ -176,14 +181,34 @@ def spoken(digits: str) -> str:
     return " ".join(digits)
 
 
-def clean_phone(phone: str | None) -> str | None:
-    """Valid ten-digit Indian mobile (accepts +91 / 91 / 0 prefixes), or None."""
-    d = re.sub(r"\D", "", (phone or "").translate(_DEV_DIGITS))
+def clean_phone(phone: str | None, types=("mobile",)) -> str | None:
+    """A valid phone number for this business, or None.
+
+    types: "mobile" (10 digits, 6-9 first; +91 / 91 / 0 prefixes accepted),
+    "landline" (Indian STD code + number, 10 digits without the leading 0, e.g.
+    020 2543 1234), "international" (+country code, 8-15 digits, kept with "+")."""
+    raw = (phone or "").translate(_DEV_DIGITS).strip()
+    d = re.sub(r"\D", "", raw)
+    is_plus = raw.startswith("+") or raw.startswith("00")
+    if d.startswith("00"):
+        d = d[2:]
+    if is_plus and not d.startswith("91"):
+        return f"+{d}" if "international" in types and 8 <= len(d) <= 15 else None
     if len(d) == 12 and d.startswith("91"):
         d = d[2:]
     elif len(d) == 11 and d.startswith("0"):
         d = d[1:]
-    return d if re.fullmatch(r"[6-9]\d{9}", d) else None
+    if re.fullmatch(r"[6-9]\d{9}", d):
+        return d
+    if "landline" in types and re.fullmatch(r"[1-9]\d{9}", d) and not _junk_number(d):
+        return d
+    return None
+
+
+def _junk_number(d: str) -> bool:
+    """1234567890 / 5555555555-style numbers: any 10 digits fit a landline's shape,
+    so these jokes would otherwise pass."""
+    return len(set(d)) <= 2 or d in "0123456789012345678" or d in "9876543210987654321"
 
 
 def extract_digits(text: str) -> str:
@@ -255,6 +280,11 @@ class ContactFlow:
     MAX_UNCLEAR = 2  # unclear answers per step before handing back to the LLM
 
     def __init__(self) -> None:
+        # Set per business (tools.AppointmentTools.set_profile): what a booking is
+        # called, and the persona's gender for Hindi verb forms.
+        self.booking = {"en": "consultation", "hi": "consultation"}
+        self.gender = "female"
+        self.phone_types: tuple[str, ...] = ("mobile",)  # + "landline" / "international"
         self.reset()
 
     def reset(self) -> None:
@@ -273,7 +303,8 @@ class ContactFlow:
         return self.stage is not None
 
     def _t(self, key: str, lang: str, **kw) -> str:
-        return TEXTS.get(lang, TEXTS["en"])[key].format(**kw)
+        kw.setdefault("booking", self.booking.get(lang, self.booking["en"]))
+        return gendered(TEXTS.get(lang, TEXTS["en"])[key].format(**kw), self.gender)
 
     def start(
         self, tool: str, requirement: str | None, name: str | None, lang: str, caller: str | None,
@@ -369,8 +400,8 @@ class ContactFlow:
             self.name = name
             # Check if caller also provided 10 digits in the same turn
             digits = extract_digits(text)
-            if digits and clean_phone(digits):
-                phone = clean_phone(digits)
+            if digits and clean_phone(digits, self.phone_types):
+                phone = clean_phone(digits, self.phone_types)
                 self.phone, self.stage = phone, "confirm"
                 return Step(say=self._t("confirm", lang, spoken=spoken(phone)))
             return Step(say=self._after_name(lang, caller))
@@ -403,6 +434,14 @@ class ContactFlow:
             slot = f"Preferred: {text.strip()}"
             self.requirement = f"{self.requirement} ({slot})" if self.requirement else slot
             return Step(say=self._t("time_noted", lang))
+        if "international" in self.phone_types and re.search(r"\+\s*\d|\bplus\b|प्लस", text, re.I):
+            # "+44 20 7946 0958" / "plus four four...": the whole number in one go.
+            spoken_plus = re.sub(r"\bplus\b|प्लस", "+", _words_to_digits(text), flags=re.I)
+            m = re.search(r"\+[\d\s-]{6,}", spoken_plus)
+            phone = clean_phone(m.group(0), self.phone_types) if m else None
+            if phone:
+                self.digits, self.phone, self.stage = "", phone, "confirm"
+                return Step(say=self._t("confirm", lang, spoken=spoken(phone)))
         new = extract_digits(text)
         if not new:
             self.digits = ""
@@ -417,8 +456,8 @@ class ContactFlow:
             return self._unclear(lang, None, "ask_digits", is_question)
         self.unclear = 0
         buf = self.digits + new
-        if len(buf) > 10 and clean_phone(new):
-            buf = clean_phone(new)
+        if len(buf) > 10 and clean_phone(new, self.phone_types):
+            buf = clean_phone(new, self.phone_types)
         if not self.digits and len(buf) == 11 and buf.startswith("0"):
             buf = buf[1:]
         if len(buf) < 10:
@@ -428,12 +467,18 @@ class ContactFlow:
         if len(buf) > 10:
             self.digits = ""
             return self._bad_number(lang, "too_many")
-        phone = clean_phone(buf)
+        phone = clean_phone(buf, self.phone_types)
         self.digits = ""
         if not phone:
-            return self._bad_number(lang, "invalid")
+            return self._bad_number(lang, self._invalid_key())
         self.phone, self.stage = phone, "confirm"
         return Step(say=self._t("confirm", lang, spoken=spoken(phone)))
+
+    def _invalid_key(self) -> str:
+        """The "that number isn't valid" line that matches what this business accepts."""
+        if "international" in self.phone_types:
+            return "invalid_intl"
+        return "invalid_landline" if "landline" in self.phone_types else "invalid"
 
     def _bad_number(self, lang: str, key: str) -> Step:
         self.bad_numbers += 1
