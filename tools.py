@@ -14,7 +14,11 @@ from google import genai
 from livekit.agents import JobContext, RunContext, function_tool
 from livekit.agents.beta.workflows import WarmTransferTask
 
-from contact_flow import _BOOKING_WORDS, _CALLBACK_WORDS, _OFFER, ContactFlow, clean_phone, name_from_history
+from contact_flow import ContactFlow, clean_phone, name_from_history
+from intents import (
+    ACK, BOOKING_WORDS, CALLBACK_WORDS, CONTACT_WORDS, GOODBYE, OFFER, PRICING_QUESTION, SHORT_NO, SIGNOFF, SMALL_TALK,
+)
+from replies import CALLBACK_OFFER, GOODBYES, TRANSFER_FAILED_LINES, speak
 from routing import DEFAULT_CONFIG, CallConfig
 from database import log_knowledge_gap, update_call_lead
 from dynamic_executor import execute_tool_call, is_executable
@@ -38,12 +42,6 @@ _RELEVANCE_FLOOR = 0.40    # below this a chunk is pure noise
 _GAP_THRESHOLD = 0.55      # best match below this = KB probably can't answer
 _MIN_GAP_WORDS = 3         # don't log fragments as knowledge gaps
 _RETRIEVAL_TIMEOUT_S = 1.5 # never hold the reply longer than this
-# Pure small talk: no lookup needed.
-_SMALL_TALK = re.compile(
-    r"^(?:hi|hello|hey|hii|ok|okay|yes|yeah|yep|no|nope|thanks|thank you|bye|"
-    r"hmm+|haan|ha|nahi|theek hai|accha|achha|namaste|हाँ|नहीं|ठीक है|अच्छा|नमस्ते)[\s.!?,]*$",
-    re.I,
-)
 
 # STT mis-hearings of Zryth names -> spelling used in the knowledge base.
 # Sarvam STT has no keyterm boosting, so we normalise before retrieval.
@@ -54,75 +52,6 @@ _NAME_ALIASES = [
     (re.compile(r"\b(?:oswal|oswall|osval|oswaal)\b", re.I), "Oswaal"),
     (re.compile(r"\b(?:zyrth|zrith|zerith|zirith|zirth|zerth|zareth|zarith|zarid|zerid|zaret)\b", re.I), "Zryth"),
 ]
-
-# A bare "no" answering "anything else?" also means the caller is done.
-_SHORT_NO = re.compile(
-    r"^\W*(?:no|nope|nah|no no|nothing|not really|nahi|nahin|नहीं|ना|जी नहीं|नहीं जी|कुछ नहीं|"
-    r"नहीं धन्यवाद|no thank you|no that's it|बस|बस इतना ही)\W*$", re.I
-)
-
-# Maya's reply already sounds like a goodbye ("आपका दिन शुभ हो!", "have a great day").
-_SIGNOFF = re.compile(
-    r"goodbye|\bbye\b|have a (?:good|nice|great) day|team will (?:contact|call)|"
-    r"anything else|शुभ हो|नमस्ते|अलविदा|संपर्क करेगी|कॉल करेगी|और किसी|और कुछ",
-    re.I,
-)
-# Short acknowledgements that, after a sign-off, mean "okay, bye".
-_ACK = re.compile(
-    r"^\W*(?:ok|okay|ok ok|alright|sure|fine|great|yes|ji|ठीक है|ठीक|अच्छा|ओके|हाँ|जी)"
-    r"(?:\s+(?:hai|bhai|ji|sir|madam|भाई|जी|सर|मैडम|है))*\W*$",
-    re.I,
-)
-
-# Spoken by end_call itself, so every call ends the same polite way.
-_GOODBYES = {
-    "en": "Thank you for calling {business}. Have a great day, goodbye!",
-    "hi": "{business} को कॉल करने के लिए धन्यवाद। आपका दिन शुभ हो, नमस्ते!",
-}
-
-# Caller is wrapping up: only then may end_call actually hang up.
-_GOODBYE_STRONG = re.compile(
-    r"\b(?:bye|goodbye|good night|that's all|thats all|that is all|no thanks?|nothing else|"
-    r"not now|that's it|thats it|i'm done|im done|hang up|cut the call|"
-    r"ok bye|okay bye|rakhta|rakhti|take care|see you|see ya|"
-    r"have a (?:good|nice|great) day)\b|बाय|बस इतना|और कुछ नहीं|रखता|रखती",
-    re.I,
-)
-# Polite words that are just as often mid-conversation ("Thanks! And do you build
-# apps?", "Alright, tell me more"): a goodbye only when nothing else is asked.
-_GOODBYE_SOFT = re.compile(
-    r"\b(?:thank you|thanks|thank u|done|chalo|alright|all right|ok then|okay then)\b|धन्यवाद|शुक्रिया|चलो",
-    re.I,
-)
-_STILL_TALKING = re.compile(
-    r"\?|\b(?:and|but|also|what|which|how|why|when|where|who|can|could|do|does|tell|more|"
-    r"explain|about|need|want|please)\b|और|लेकिन|क्या|कैसे|कब|कहाँ|कौन|बताइए|बताओ|बता|चाहिए|मुझे",
-    re.I,
-)
-
-
-class _Goodbye:
-    """`_GOODBYE.search(text)`: True when the caller's words mean they're done."""
-
-    @staticmethod
-    def search(text: str) -> bool:
-        if _GOODBYE_STRONG.search(text):
-            return True
-        if not _GOODBYE_SOFT.search(text):
-            return False
-        # "Thanks", "Okay thank you", "धन्यवाद जी": short and nothing more asked.
-        rest = _GOODBYE_SOFT.sub(" ", text)
-        return len(text.split()) <= 5 and not _STILL_TALKING.search(rest)
-
-
-_GOODBYE = _Goodbye()
-
-
-_PRICING_Q = re.compile(
-    r"\b(?:price|prices|pricing|cost|costs|charge|charges|fee|fees|rate|rates|quote|budget|"
-    r"how much|kitna|kitne|keemat|daam|paisa|paise)\b|कीमत|दाम|कितना|कितने|शुल्क",
-    re.I,
-)
 
 
 def normalise_names(text: str) -> str:
@@ -380,16 +309,6 @@ def _clean_phone(phone: str | None) -> str | None:
 _PLACEHOLDERS = {"", "user", "caller", "customer", "unknown", "none", "null", "n/a", "na", "name", "phone"}
 
 
-# Tool result that agent.llm_node speaks word for word instead of asking the LLM.
-# (session.say() from inside a tool was queued behind the reply still playing:
-# the name question came 4 turns late while Gemini invented "we've booked it".)
-SAY_MARKER = "[[SAY]]"
-
-
-def speak(line: str) -> str:
-    return SAY_MARKER + line
-
-
 def _user_texts(context: RunContext) -> list[str]:
     """Caller transcripts so far, oldest first ([] if the history can't be read)."""
     try:
@@ -440,14 +359,6 @@ def _last_reply_asked(context: RunContext, pattern: str) -> bool:
     return False
 
 
-# Caller asked to be contacted / gave contact intent in their own words.
-_CONTACT_WORDS = re.compile(
-    r"\b(?:call me|callback|call back|contact me|reach me|my number|interested|sign me up)\b"
-    r"|कॉल कर|कॉल बैक|संपर्क कर|बात करवा|मेरा नंबर|interested",
-    re.I,
-)
-
-
 def _labelled(tool: str, requirement: Optional[str]) -> str:
     """The calls row has one requirement field for both tools: tag which one it was
     so the team can tell a callback request from a consultation booking."""
@@ -468,8 +379,8 @@ def _wants_contact(context: RunContext) -> bool:
     users = [m.text_content for m in recent if m.role == "user"]
     replies = [m.text_content for m in recent if m.role == "assistant"]
     return any(
-        _BOOKING_WORDS.search(t) or _CALLBACK_WORDS.search(t) or _CONTACT_WORDS.search(t) for t in users
-    ) or any(_OFFER.search(t) for t in replies)
+        BOOKING_WORDS.search(t) or CALLBACK_WORDS.search(t) or CONTACT_WORDS.search(t) for t in users
+    ) or any(OFFER.search(t) for t in replies)
 
 
 def _user_turns(context: RunContext) -> int:
@@ -478,21 +389,6 @@ def _user_turns(context: RunContext) -> int:
         return sum(1 for m in context.session.history.items if getattr(m, "role", None) == "user")
     except Exception:
         return -1
-
-
-# end_call's one-time offer before hanging up on a caller whose details weren't
-# saved. A "yes" starts the contact flow (it matches contact_flow._OFFER).
-CALLBACK_OFFER = {
-    "en": "Before you go, should our team call you back with more details?",
-    "hi": "जाने से पहले, क्या हमारी टीम आपको ज़्यादा जानकारी के लिए वापस कॉल करे?",
-}
-
-# Spoken by transfer_to_human itself when the transfer fails; ends with a callback
-# offer, so a "yes" starts the contact flow.
-_TRANSFER_FAILED_LINES = {
-    "en": "Sorry, nobody from the team is free right now. Should our team call you back?",
-    "hi": "माफ़ कीजिए, अभी टीम में कोई उपलब्ध नहीं है। क्या हमारी टीम आपको वापस कॉल करे?",
-}
 
 
 class AppointmentTools:
@@ -639,7 +535,7 @@ class AppointmentTools:
         is weak are logged as knowledge gaps.
         """
         text = normalise_names((text or "").strip())
-        if not text or _SMALL_TALK.match(text):
+        if not text or SMALL_TALK.match(text):
             return tuple()
         t0 = time.perf_counter()
         try:
@@ -658,7 +554,7 @@ class AppointmentTools:
         if (
             best < _GAP_THRESHOLD
             and len(text.split()) >= _MIN_GAP_WORDS
-            and not _PRICING_Q.search(text)
+            and not PRICING_QUESTION.search(text)
         ):
             asyncio.create_task(self._log_gap(text))
         return chunks
@@ -757,7 +653,7 @@ class AppointmentTools:
         "yes" starts the contact flow). Left to the LLM, the apology came turns later,
         in English, as the answer to something else."""
         lang = getattr(context.session.current_agent, "code", "en")
-        context.session.say(_TRANSFER_FAILED_LINES.get(lang, _TRANSFER_FAILED_LINES["en"]))
+        context.session.say(TRANSFER_FAILED_LINES.get(lang, TRANSFER_FAILED_LINES["en"]))
         return None
 
     @function_tool
@@ -799,8 +695,8 @@ class AppointmentTools:
         except Exception:
             log.exception("end_call: could not read history")
         # "ठीक है भाई" / "okay" right after Maya already said goodbye means the caller is done.
-        acked_goodbye = bool(_SIGNOFF.search(prev_reply)) and bool(_ACK.match(last_user))
-        if last_user and not (_GOODBYE.search(last_user) or _SHORT_NO.match(last_user) or acked_goodbye):
+        acked_goodbye = bool(SIGNOFF.search(prev_reply)) and bool(ACK.match(last_user))
+        if last_user and not (GOODBYE.search(last_user) or SHORT_NO.match(last_user) or acked_goodbye):
             log.info("end_call refused; caller said %r", last_user)
             if spoke_after:
                 return None  # she already answered; a tool reply would make her speak twice
@@ -812,7 +708,7 @@ class AppointmentTools:
         # Skipped when they just declined Maya's own offer ("book a consultation?" ->
         # "no thanks, bye"): asking again ignores the answer they just gave.
         if (self.saved_contact is None and not self.callback_offered and not self.is_transferring
-                and not _OFFER.search(prev_reply)):
+                and not OFFER.search(prev_reply)):
             self.callback_offered = True
             self._offer_turn = _user_turns(context)
             log.info("end_call deferred once for a callback offer")
@@ -839,7 +735,7 @@ class AppointmentTools:
         if self.on_end_requested:
             self.on_end_requested()
         session.say(
-            _GOODBYES.get(lang, _GOODBYES["en"]).format(business=self.config.business_name),
+            GOODBYES.get(lang, GOODBYES["en"]).format(business=self.config.business_name),
             allow_interruptions=False,
         )
 
@@ -852,8 +748,8 @@ class AppointmentTools:
         if not t or "?" in t or len(t.split()) > 6:
             return False
         return bool(
-            _GOODBYE.search(t) or _SHORT_NO.match(t)
-            or (_SIGNOFF.search(prev_reply or "") and (_ACK.match(t) or re.match(r"^\W*(?:no|नहीं|ना)(?=\W|$)", t, re.I)))
+            GOODBYE.search(t) or SHORT_NO.match(t)
+            or (SIGNOFF.search(prev_reply or "") and (ACK.match(t) or re.match(r"^\W*(?:no|नहीं|ना)(?=\W|$)", t, re.I)))
         )
 
 
