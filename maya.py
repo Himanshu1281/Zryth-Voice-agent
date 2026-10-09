@@ -21,10 +21,10 @@ from livekit.agents import Agent, RunContext, function_tool
 
 from business import gendered
 from config import BCP47, SUPPORTED_LANGUAGES
-from contact_flow import extract_digits, name_from_history
+from contact_flow import extract_digits, extract_name, name_from_history
 from database import update_call_lead
 from intents import (
-    ACCEPT, ALREADY_TOLD, BOOKING_WORDS, CALLBACK_WORDS, CLEAR_GOODBYE, EMERGENCY, HOLD, HUMAN, INTERESTED, NO, NOT_A_YES, OFFER,
+    ACCEPT, ALREADY_TOLD, BOOKING_WORDS, CALLBACK_WORDS, CLEAR_GOODBYE, EMERGENCY, HOLD, GAVE_NAME, HUMAN, INTERESTED, NO, NOT_A_YES, OFFER, PROMISED,
     OFFICE_HOURS, QUESTION, SAME, TALK, TIME_OR_DATE, TOPIC, UNKNOWN_FACT, WANT, WHERE, YES,
 )
 from language import (
@@ -314,7 +314,7 @@ class BaseMayaAgent(Agent):
                     content=(
                         "(You already said that. I don't want to answer that question. Don't ask it again: "
                         f"say something new, in {LANG_NAMES[self.code]}, e.g. ask if I have any question about "
-                        f"{self.kb.config.business_name if self.kb else 'the company'}.)"
+                        f"{self.kb.profile.name if self.kb else 'the company'}.)"
                     ),
                 )
                 continue
@@ -454,7 +454,7 @@ class BaseMayaAgent(Agent):
             turn_ctx.add_message(
                 role="system",
                 content=(
-                    f"Relevant {self.kb.config.business_name} knowledge (reference only; never read it out verbatim, "
+                    f"Relevant {self.kb.profile.name} knowledge (reference only; never read it out verbatim, "
                     "answer only what was asked in at most 2 short spoken sentences, no lists or markdown):\n"
                     + "\n\n".join(chunks)
                 ),
@@ -615,10 +615,15 @@ class BaseMayaAgent(Agent):
         asked = (
             bool(books(text) and WANT.search(text)) or bool(CALLBACK_WORDS.search(text))
             or bool(INTERESTED.search(text.strip()))
+            # "मेरा नाम हिमांशु है" out of the blue: they want a callback.
+            or (bool(GAVE_NAME.search(text)) and bool(extract_name(text)) and self.kb.saved_contact is None)
         )
         # "Okay thanks, bye" after an offer is a goodbye, not a yes.
+        # "मैं कंसल्टेशन बुक कर रही हूँ" (no tool called, nothing saved) then "karo":
+        # Gemini said "बुक कर दिया" without ever asking name or number.
+        promised = bool(PROMISED.search(last_reply)) and self.kb.saved_contact is None
         accepted = (
-            bool(OFFER.search(last_reply)) and "?" in last_reply
+            bool(OFFER.search(last_reply) or books(last_reply)) and ("?" in last_reply or promised)
             and len(text.split()) <= 8
             # "इसी नंबर पर" / "same number" to "should our team call you?" is a yes too.
             and bool(YES.search(text) or ACCEPT.search(text) or SAME.search(text))
@@ -638,7 +643,7 @@ class BaseMayaAgent(Agent):
         elif CALLBACK_WORDS.search(text):
             booking = False
         else:
-            booking = books(last_reply)
+            booking = books(last_reply) or bool(PROMISED.search(last_reply))
         tool = "book_consultation" if booking else "capture_lead"
         recent = [
             m.text_content for m in turn_ctx.items

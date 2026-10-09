@@ -580,3 +580,15 @@ CASES += [
          forbid=[r"(?:हाँ|yes)[^.?।]*Max Bupa[^.?।]*(?:चलता|accept|cashless)"],
          note="Listed insurer yes, unlisted insurer not invented"),
 ]
+
+# Real call 2026-10-09 (RM_nhK6HRgpmWRD): yes to a KB-worded offer, then "karo", and Maya said
+# "बुक कर दिया" without ever asking for a name or number.
+CASES += [
+    Case("offer_yes_then_karo", "core", "hi",
+         ["जी हमारा पटना में coaching institute है, 10,000 बच्चे हैं, रोज़ counseling के doubts आते हैं, AI से क्या solve कर सकते हैं?",
+          "yes sure go ahead", "बच्चे जो course लेना चाहते हैं उसके related AI agent चाहिए", "haan ji", "karo",
+          "मेरा नाम हिमांशु है", "इसी नंबर पर", "हाँ", "नहीं"],
+         save=True, end=True,
+         forbid=[r"बुक कर दिया|booked (?:a|your|the)"],
+         note="Accepting Maya's offer must lead to name + number, never a fake 'booked'"),
+]

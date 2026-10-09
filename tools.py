@@ -804,7 +804,7 @@ class AppointmentTools:
         if self.on_end_requested:
             self.on_end_requested()
         session.say(
-            GOODBYES.get(lang, GOODBYES["en"]).format(business=self.config.business_name),
+            GOODBYES.get(lang, GOODBYES["en"]).format(business=self.profile.name),
             allow_interruptions=False,
         )
 

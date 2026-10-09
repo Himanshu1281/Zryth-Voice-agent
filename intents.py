@@ -30,8 +30,9 @@ ACK = re.compile(
 )
 
 ACCEPT = re.compile(
-    r"\b(?:interested|sounds good|go ahead|let's do it|lets do it|why not|please do|sure|jarur|jaroor|zaroor|zarur|bilkul)\b"
-    r"|ज़रूर|जरूर|चलिए|कर दीजिए|कर दो|बिल्कुल|बिलकुल",
+    r"\b(?:interested|sounds good|go ahead|let's do it|lets do it|why not|please do|sure|jarur|jaroor|zaroor|zarur|bilkul|"
+    r"karo|kar do|kar dijiye|kariye|karie|kijiye|book karo|book kar do)\b"
+    r"|ज़रूर|जरूर|चलिए|कर दीजिए|कर दो|करो|करिए|कीजिए|बिल्कुल|बिलकुल",
     re.I,
 )
 
@@ -149,7 +150,26 @@ TALK = re.compile(
 
 OFFER = re.compile(
     r"consultation|demo|meeting|team (?:to )?(?:call|reach|contact)|call you back|"
-    r"कंसल्टेशन|डेमो|मीटिंग|टीम.*(?:कॉल|संपर्क|बात)|बुक",
+    # "क्या आप चाहेंगे कि हम एक फ्री डिस्कवरी ऑडिट करें?": the KB's own offer words
+    r"\bfree\b|audit|discovery|session|site visit|visit (?:us|our)|trial|appointment|book|"
+    r"कंसल्टेशन|डेमो|मीटिंग|टीम.*(?:कॉल|संपर्क|बात)|बुक|फ्री|फ़्री|ऑडिट|डिस्कवरी|सेशन|विज़िट|विजिट|ट्रायल|अपॉइंटमेंट",
+    re.I,
+)
+
+# The caller volunteers their name ("मेरा नाम हिमांशु है", "my name is Ravi"): they want to
+# be contacted, so take the number (the LLM said "nice to meet you" and moved on).
+GAVE_NAME = re.compile(
+    r"\b(?:my name is|my name's|myself|mera naam|mera nam|merra naam)\b|मेरा नाम|मेरी नाम|"
+    r"\b(?:bol raha|bol rahi) (?:hoon|hu|hun)\b|बोल रह[ाी] (?:हूँ|हूं)",
+    re.I,
+)
+
+# Maya promised or claimed a booking ("मैं कंसल्टेशन बुक कर देती हूँ", "I've booked it")
+# before any name/number was taken: the caller's next yes must start the contact flow.
+PROMISED = re.compile(
+    r"\b(?:i'?ll|i will|let me|i'?m going to|i am going to|i'?ve|i have)\s+(?:go ahead and\s+)?"
+    r"(?:book|booked|schedule|scheduled|set up|arrange|arranged)\b|\bbooked (?:a|your|the|it)\b"
+    r"|बुक कर (?:देती|देता|रही|रहा|दिया|दी|दूँ|दूं)|बुक हो (?:गया|गई|जाएगा)|शेड्यूल कर",
     re.I,
 )
 

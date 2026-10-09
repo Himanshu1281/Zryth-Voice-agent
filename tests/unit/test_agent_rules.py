@@ -241,3 +241,44 @@ def test_prompt_has_truth_and_no_connect_promise():
     text = prompts.build_instructions("hi", prompts.STYLE_NOTES["hi"])
     assert "TRUTH:" in text
     assert "offer to connect them" not in text
+
+
+# Real call 2026-10-09: "फ्री डिस्कवरी ऑडिट करें?" -> "haan ji" was not a yes, then the LLM said
+# "कंसल्टेशन बुक कर रही हूँ" -> "karo" -> "बुक कर दिया" without asking name or number.
+@pytest.mark.parametrize("reply", [
+    "क्या आप चाहेंगे कि हम इस पर एक फ्री डिस्कवरी ऑडिट करें?",
+    "Would you like a free discovery audit?",
+])
+def test_kb_worded_offer_is_an_offer(reply):
+    from intents import OFFER
+    assert OFFER.search(reply)
+
+
+@pytest.mark.parametrize("reply, expected", [
+    ("ज़रूर, मैं आपके लिए एक कंसल्टेशन बुक कर रही हूँ।", True),
+    ("बहुत बढ़िया! मैं आपके लिए एक कंसल्टेशन बुक कर देती हूँ।", True),
+    ("Great, I'll book a consultation for you.", True),
+    ("क्या आप जानना चाहेंगे कि हम यह कैसे कर सकते हैं?", False),
+])
+def test_booking_promise(reply, expected):
+    from intents import PROMISED
+    assert bool(PROMISED.search(reply)) == expected
+
+
+@pytest.mark.parametrize("text", ["karo", "kar do", "हाँ करो", "book kar do"])
+def test_karo_is_a_yes(text):
+    from intents import ACCEPT
+    assert ACCEPT.search(text)
+
+
+@pytest.mark.parametrize("text, expected", [
+    ("मेरा नाम हिमांशु है", True),
+    ("my name is Ravi Kumar", True),
+    ("main Sunil bol raha hoon", True),
+    ("what is your name?", False),
+    ("naam mein kya rakha hai", False),
+])
+def test_volunteered_name(text, expected):
+    from contact_flow import extract_name
+    from intents import GAVE_NAME
+    assert bool(GAVE_NAME.search(text) and extract_name(text)) == expected
