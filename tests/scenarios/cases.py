@@ -512,7 +512,7 @@ CASES += [
          ["Do you have commercial shops or plots?", "What is the monthly maintenance charge?", "bye"],
          save=False, end=True, kb="real_estate", allow_prices=True,
          forbid=[r"maintenance[^.?]*(?:Rs\.?|₹|rupees)\s*\d", r"(?:Rs\.?|₹)\s*\d[^.?]*maintenance",
-                 r"(?:yes|we do)[^.?]*(?:commercial shops|plots)"],
+                 r"(?:\byes\b|\bwe do\b(?!n|\s+not))[^.?]*(?:commercial shops|plots)"],
          note="Not in the KB: no invented maintenance figure or commercial projects"),
 
     # ---------------------------------------------------------- Vidya Path Academy, Kota
@@ -591,4 +591,17 @@ CASES += [
          save=True, end=True,
          forbid=[r"बुक कर दिया|booked (?:a|your|the)"],
          note="Accepting Maya's offer must lead to name + number, never a fake 'booked'"),
+]
+
+# Real call 2026-10-09 09:16 (mill software): "हां एक demo करवा सकते हैं आप" got "नाम ठीक से
+# सुनाई नहीं दिया" before the name was ever asked.
+CASES += [
+    Case("demo_ask_mid_call", "core", "hi",
+         ["जी mail software से related आप क्या क्या software provide करते हैं?",
+          "अच्छा इसमें stock counting भी शामिल है क्या?",
+          "मेरे पास already software है, मेरे को stock auditing से related चाहिए था",
+          "हां एक demo करवा सकते हैं आप।", "राकेश", "इसी number पर", "हाँ", "नहीं ठीक है"],
+         save=True, end=True,
+         forbid=[r"नाम ठीक से सुनाई नहीं"],
+         note="A demo request gets 'may I know your name', not 'didn't catch your name'"),
 ]

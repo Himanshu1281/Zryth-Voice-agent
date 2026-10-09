@@ -82,7 +82,7 @@ from prompts import greeting
 from maya import GreeterAgent
 from replies import NUMBER_NOT_ACTIVE
 from routing import CallConfig, resolve_call_config
-from tools import AppointmentTools, build_dynamic_tools, summarize_transcript
+from tools import AppointmentTools, build_dynamic_tools, call_outcome, summarize_transcript
 
 from database import (
     create_call,
@@ -405,21 +405,22 @@ async def entrypoint(ctx: JobContext) -> None:
                     call_id,
                     result.get("summary", ""),
                     result.get("intent"),
-                    result.get("outcome"),
+                    call_outcome(result.get("outcome"), tools_instance.saved_tool),
                 )
             except Exception:
                 log.exception("Failed to save call summary")
 
-        # Fallback for dashboard: ensure lead details are recorded
+        # The caller gave a name but hung up before the number was confirmed: keep the
+        # name. Nothing else: a saved lead is already written (finish_contact), and a
+        # call with no name used to be stored as "Caller" and looked like a lead.
         final_name = getattr(tools_instance, "known_name", None) or tools_instance.contact.name
-        final_phone = tools_instance.contact.phone or tools_instance.clean_caller()
-        if final_name or final_phone:
+        if tools_instance.saved_contact is None and final_name:
             try:
                 await asyncio.to_thread(
                     update_call_lead,
                     call_id=call_id,
-                    customer_name=final_name or "Caller",
-                    phone=final_phone,
+                    customer_name=final_name,
+                    phone=tools_instance.contact.phone or tools_instance.clean_caller(),
                     requirement=tools_instance.contact.requirement,
                 )
             except Exception:

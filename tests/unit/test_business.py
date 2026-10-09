@@ -115,3 +115,26 @@ def test_tools_take_the_profile():
     assert t.profile.name == "Skyline Homes"
     t.set_profile(CLINIC)
     assert t.contact.booking["en"] == "appointment"
+
+
+def test_read_only_cache_still_returns_extracted_profile(tmp_path, monkeypatch):
+    # VPS (systemd ProtectSystem=strict): data/profiles was read-only and the cache write
+    # raised. The extracted profile must still be used.
+    blocker = tmp_path / "not_a_dir"
+    blocker.write_text("x")
+    monkeypatch.setattr(business, "CACHE_DIR", blocker / "profiles")
+    monkeypatch.setattr(business, "_extract_with_llm", lambda kb, model: {"booking_en": "site visit"})
+    p = business.build_profile("agent-x", "Skyline Homes. Book a site visit.")
+    assert p.booking_en == "site visit"
+
+
+@pytest.mark.parametrize("llm, saved, expected", [
+    ("lead_captured", None, "unresolved"),          # real call: no lead, marked lead_captured
+    ("consultation_booked", None, "unresolved"),
+    ("answered", None, "answered"),
+    ("answered", "capture_lead", "lead_captured"),
+    ("lead_captured", "book_consultation", "consultation_booked"),
+])
+def test_call_outcome_comes_from_what_was_saved(llm, saved, expected):
+    from tools import call_outcome
+    assert call_outcome(llm, saved) == expected

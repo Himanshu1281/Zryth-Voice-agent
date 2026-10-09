@@ -173,3 +173,24 @@ def test_already_told_without_name_asks_once_more():
     f, _ = flow(tool="book_consultation", caller=None)
     assert "once more" in say(f, "abhi tho bola", caller=None)
     assert f.name is None
+
+
+# Real call 2026-10-09: "same number per call kar sakte hain" came through STT as
+# "किसी number पर phone कर सकते हैं" and Maya asked "same or another number?" again.
+@pytest.mark.parametrize("text", [
+    "किसी number पर phone कर सकते हैं।",
+    "same number per call kar sakte hain",
+    "isi number pe kar lo",
+    "is number par",
+    "jis number se call kiya usi pe",
+])
+def test_same_number_variants(text):
+    f, _ = flow("hi", name="Rakesh")
+    turn = f.handle(text, "hi", CALLER)
+    assert f.phone == CALLER and "कन्फ़र्म" in turn.say
+
+
+def test_other_number_still_other():
+    f, _ = flow("hi", name="Rakesh")
+    turn = f.handle("दूसरे नंबर पर", "hi", CALLER)
+    assert f.phone is None and "दस अंकों" in turn.say

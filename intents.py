@@ -42,8 +42,11 @@ NOT_A_YES = re.compile(
 )
 
 SAME = re.compile(
-    r"\b(?:same|this number|this one|current|calling from|this|here|callback)\b|"
-    r"यही|इसी|इस\s*(?:नंबर|नम्बर|number)|जिससे|इसपे|इस\s*पे|इसी\s*पे|इसी\s*पर|कॉल\s*बैक",
+    r"\b(?:same|this number|this one|current|calling from|this|here|callback|"
+    r"isi|yahi|isse|is number|is no|jis number|jisse|wahi|usi)\b|"
+    r"यही|इसी|इस\s*(?:नंबर|नम्बर|number)|जिससे|जिस\s*(?:नंबर|नम्बर|number)|इसपे|इस\s*पे|इसी\s*पे|इसी\s*पर|कॉल\s*बैक|"
+    # Sarvam heard "इसी number पर" as "किसी number पर" on a phone line.
+    r"किसी\s*(?:भी\s*)?(?:नंबर|नम्बर|number)\s*(?:पर|पे)",
     re.I,
 )
 

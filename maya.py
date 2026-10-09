@@ -34,7 +34,7 @@ from language import (
 from prompts import LANG_NAMES, STYLE_NOTES, build_instructions
 from replies import (
     CALLBACK_OFFER, EMERGENCY_LINE, EMERGENCY_REPEAT, EMPTY_REPLY_FALLBACK, FILLERS, GENERIC_TOOL_FALLBACK, LENGTH_RULE, MARKDOWN,
-    MAX_REPLY_SENTENCES, MIN_SENTENCE_WORDS, NO_TRANSFER, OFFICE_ADDRESS, OFFICE_HOURS_ASK, OFFICE_HOURS_SAVED,
+    MAX_REPLY_CHARS, MAX_REPLY_SENTENCES, MIN_SENTENCE_WORDS, NO_TRANSFER, OFFICE_ADDRESS, OFFICE_HOURS_ASK, OFFICE_HOURS_SAVED,
     JARGON_HOLD_WORDS, META_ASIDE, META_LOOKAHEAD, SAY_MARKER, SENTENCE_END, TOOL_REPLY_FALLBACK, office_address,
     repeats_earlier, scrub_jargon,
 )
@@ -96,6 +96,7 @@ class BaseMayaAgent(Agent):
             return
         live = MAX_REPLY_SENTENCES - 1  # sentences spoken as they stream
         sentences = 0
+        spoken = 0  # characters already sent to TTS
         held = ""   # text after the last space: a "." there may be "FinanceAuditor.ai"
         tail = None  # once `live` sentences are out, the rest is buffered here
         muted = False  # the model started an instruction-like aside: drop the rest
@@ -126,7 +127,8 @@ class BaseMayaAgent(Agent):
                 if len(piece.split()) < MIN_SENTENCE_WORDS:
                     continue  # "नमस्ते!" / "Got it." would push the real answer out
                 sentences += 1
-                if sentences >= live:
+                # Long Hindi sentences: 3 of them were 23 s of audio and the caller cut in.
+                if sentences >= live or spoken + m.end() >= MAX_REPLY_CHARS:
                     yield buf[: m.end()]
                     tail, held = buf[m.end():], ""
                     break
@@ -149,6 +151,7 @@ class BaseMayaAgent(Agent):
                 split = min(split, paren)
             if split > 0:
                 yield buf[:split]
+                spoken += split
                 held = buf[split:]
             else:
                 held = buf
@@ -404,17 +407,18 @@ class BaseMayaAgent(Agent):
         if (conf is not None and conf < MIN_TRANSCRIPT_CONFIDENCE and len(text.split()) <= 3
                 and not re.search(r"\d", text) and not expected_answer):
             log.info("Ignoring low-confidence transcript %r (%.2f)", text, conf)
-            raise agents.StopResponse()
+            self._drop_unclear(new_message)
         # Only English/Hindi are supported. Low-confidence text in another script is
         # STT misreading noise; a clear sentence is a caller who deserves an answer.
         if FOREIGN_SCRIPT.search(text) and not (DEVANAGARI.search(text) or LATIN.search(text)):
             if conf is not None and conf < FOREIGN_MIN_CONFIDENCE:
                 log.info("Ignoring transcript in an unsupported script %r (%.2f)", text, conf)
-                raise agents.StopResponse()
+                self._drop_unclear(new_message)
             log.info("Caller spoke an unsupported language: %r", text)
             self.session.say(gendered(UNSUPPORTED_LANGUAGE.get(self.code, UNSUPPORTED_LANGUAGE["en"]),
                                       self.kb.profile.gender if self.kb else "female"))
             raise agents.StopResponse()
+        self._unclear_streak = 0
         lang = detect_language(text)
         if lang and lang != self.code:
             await self._switch_language(lang)
@@ -533,6 +537,17 @@ class BaseMayaAgent(Agent):
             self._reply_by_code(new_message, goodbye=True)
         elif self.kb.saved_contact is None:
             self._maybe_start_contact(turn_ctx, new_message, text)
+
+    def _drop_unclear(self, new_message: agents.llm.ChatMessage) -> None:
+        """Skip one unclear transcript (a cough, line noise). A second one in a row is a
+        caller we can't hear: ask them to repeat. On a bad 8 kHz line Sarvam returned
+        "हाँजी" as 'ਹਾਂਜੀ' (0.29), then 'હા હા હોય' (0.11), then 'Hello' (0.27): all three
+        dropped, 20 s of silence, and the caller hung up."""
+        self._unclear_streak = getattr(self, "_unclear_streak", 0) + 1
+        if self._unclear_streak < 2:
+            raise agents.StopResponse()
+        self._unclear_streak = 0
+        self._reply_by_code(new_message, EMPTY_REPLY_FALLBACK.get(self.code, EMPTY_REPLY_FALLBACK["en"]))
 
     async def _translate(self, text: str, model_settings) -> str | None:
         """The reply in the caller's language (last resort of the wrong-language guard)."""

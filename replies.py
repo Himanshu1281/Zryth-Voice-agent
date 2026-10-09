@@ -55,6 +55,11 @@ MARKDOWN = re.compile(r"[*#`_]+|^\s*[-•]\s+", re.M)
 MAX_REPLY_SENTENCES = int(os.getenv("MAX_REPLY_SENTENCES", "3"))
 
 
+# ...and once this many characters are out (~10-12 s of speech), at most one more
+# sentence: the closing question.
+MAX_REPLY_CHARS = int(os.getenv("MAX_REPLY_CHARS", "260"))
+
+
 # A sentence ends at . ! ? or । followed by a space or newline ("FinanceAuditor.ai"
 # and "2.5" are not sentence ends).
 SENTENCE_END = re.compile(r"[.!?।](?=\s)")

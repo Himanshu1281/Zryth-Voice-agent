@@ -34,8 +34,9 @@ NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
-# strict makes the whole FS read-only; allow just the recordings dir to be written.
-ReadWritePaths=/opt/voice-agent/recordings
+# strict makes the whole FS read-only; allow recordings and data/ (LanceDB KB cache,
+# business profiles in data/profiles) to be written.
+ReadWritePaths=/opt/voice-agent/recordings /opt/voice-agent/data
 # Cap memory so a leak can't take the whole VPS (and n8n/Traefik) down.
 MemoryMax=2G
 

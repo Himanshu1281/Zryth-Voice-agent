@@ -28,7 +28,7 @@ from pathlib import Path
 log = logging.getLogger("voice-agent.business")
 
 ROOT = Path(__file__).parent
-CACHE_DIR = ROOT / "data" / "profiles"
+CACHE_DIR = Path(os.getenv("PROFILE_CACHE_DIR") or ROOT / "data" / "profiles")
 OVERRIDES_DIR = ROOT / "business_profiles"
 PROFILE_VERSION = 2  # bump when the extraction prompt changes, to refresh caches
 
@@ -226,9 +226,15 @@ def build_profile(agent_id: str | None, kb_text: str | None, name: str | None = 
     extracted = _from_kb_lines(kb_text)
     try:
         extracted.update({k: v for k, v in _extract_with_llm(kb_text, model or "gemini-2.5-flash").items() if v})
-        CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        _cache_path(agent_id, kb_text).write_text(json.dumps(extracted, ensure_ascii=False, indent=1), encoding="utf-8")
         log.info("business profile extracted for %s: booking=%r", agent_id, extracted.get("booking_en"))
     except Exception:  # noqa: BLE001 - fall back to defaults + KB lines, retried next call
         log.exception("business profile extraction failed for %s; using defaults", agent_id)
+        return _layer(extracted, agent_id, name, persona)
+    try:
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        _cache_path(agent_id, kb_text).write_text(json.dumps(extracted, ensure_ascii=False, indent=1), encoding="utf-8")
+    except OSError as e:
+        # systemd ProtectSystem=strict made /opt/voice-agent/data read-only on the VPS:
+        # the profile is still good, it just gets re-extracted next time.
+        log.warning("could not cache business profile in %s (%s); set PROFILE_CACHE_DIR to a writable dir", CACHE_DIR, e)
     return _layer(extracted, agent_id, name, persona)

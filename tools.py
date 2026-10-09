@@ -243,6 +243,16 @@ _SUMMARY_PROMPT = (
 )
 
 
+def call_outcome(llm_outcome: str | None, saved_tool: str | None) -> str | None:
+    """The dashboard outcome: what the code actually saved, not what the summary LLM
+    guessed (a call with no lead was marked "lead_captured")."""
+    if saved_tool:
+        return "consultation_booked" if saved_tool == "book_consultation" else "lead_captured"
+    if llm_outcome in ("lead_captured", "consultation_booked"):
+        return "unresolved"
+    return llm_outcome
+
+
 async def summarize_transcript(transcript: str, model: str, business: str = "the business",
                                persona: str = "the assistant") -> dict | None:
     """Post-call summary via Gemini. Returns None on any failure."""
@@ -455,6 +465,7 @@ class AppointmentTools:
         self.caller_phone: str | None = None
         # (name, phone) already saved this call -- stops duplicate bookings.
         self.saved_contact: tuple[str, str] | None = None
+        self.saved_tool: str | None = None  # capture_lead / book_consultation, once saved
         # Caller name remembered across turns to never re-ask
         self.known_name: str | None = None
         # Name + phone collection, driven turn by turn from agent.on_user_turn_completed.
@@ -580,6 +591,7 @@ class AppointmentTools:
             except Exception:
                 log.exception("Saving contact details failed")
         self.saved_contact = (name, phone)
+        self.saved_tool = flow.tool
         self.known_name = name
         log.info("%s -> %s (%s) saved", flow.tool, name, phone)
         text = flow.saved_text(lang, self.profile.name)
