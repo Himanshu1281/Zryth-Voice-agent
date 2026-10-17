@@ -61,8 +61,10 @@ from livekit.agents import (
 from livekit.agents.llm import FallbackAdapter
 from livekit.plugins import google, openai, sarvam, silero
 
+from intents import STOP_NOW
 from config import (
     AUDIO_SAMPLE_RATE,
+    MIN_INTERRUPTION_WORDS,
     BCP47,
     DEFAULT_LANGUAGE,
     MAX_ENDPOINTING_DELAY,
@@ -190,6 +192,7 @@ def _build_session(
         ),
 	tools=tools_list,
         turn_handling=TurnHandlingOptions(
+            interruption={"min_words": MIN_INTERRUPTION_WORDS},
             endpointing={
                 "mode": "fixed",
                 "min_delay": MIN_ENDPOINTING_DELAY,
@@ -375,6 +378,17 @@ async def entrypoint(ctx: JobContext) -> None:
         "conversation_item_added",
         on_conversation_item,
     )
+
+    # "रुको" / "wait" while Maya talks: stop at once, even below MIN_INTERRUPTION_WORDS.
+    def on_user_transcript(ev) -> None:
+        if session.agent_state == "speaking" and STOP_NOW.search(getattr(ev, "transcript", "") or ""):
+            log.info("Stop word while speaking (%r): interrupting", ev.transcript)
+            try:
+                session.interrupt()
+            except Exception:  # noqa: BLE001 - e.g. uninterruptible goodbye
+                log.debug("interrupt failed", exc_info=True)
+
+    session.on("user_input_transcribed", on_user_transcript)
 
     # This runs when the LiveKit job shuts down.
     async def on_shutdown(reason: str = "") -> None:

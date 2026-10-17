@@ -31,6 +31,8 @@ TEXTS: dict[str, dict[str, str]] = {
         "sure": "Sure! ",
         "drop": "No problem, let's skip that. What else can I help you with?",
         "ask_name_again": "Sorry, I didn't catch your name. Could you tell me just your name?",
+        "name_after_same": "Sure, we'll call you on this number. May I know your name?",
+        "name_after_other": "Sure, I'll take the number too. First, may I know your name?",
         "name_missed": "Sorry, I missed it. Could you tell me your name once more?",
         "name_updated": "Got it, {name}.",
         "no_caller_id": "Sorry, I can't see the number you're calling from. Could you tell me your ten-digit mobile number?",
@@ -46,6 +48,7 @@ TEXTS: dict[str, dict[str, str]] = {
         "invalid_intl": "Sorry, that doesn't look like a valid number. Could you say it again? For a number outside India, start with the country code.",
         "skip_number": "No problem, let's leave the number for now. Is there anything else I can help you with?",
         "confirm": "Just to confirm, your number is {spoken}. Is that correct?",
+        "thanks_confirm": "Thanks, {name}. Just to confirm, your number is {spoken}. Is that correct?",
         "confirm_again": "Sorry, is {spoken} the right number? Please say yes or no.",
         "retry_digits": "No problem. Could you tell me the full ten-digit number again?",
         "saved_lead": "Thank you, {name}! Your details are saved and the {business} team will contact you soon. Is there anything else I can help you with?",
@@ -56,6 +59,8 @@ TEXTS: dict[str, dict[str, str]] = {
         "sure": "ज़रूर! ",
         "drop": "कोई बात नहीं, रहने देते हैं। बताइए, मैं और कैसे मदद कर सकती हूँ?",
         "ask_name_again": "माफ़ कीजिए, नाम ठीक से सुनाई नहीं दिया। क्या आप सिर्फ़ अपना नाम बता सकते हैं?",
+        "name_after_same": "ज़रूर, इसी नंबर पर कॉल करेंगे। क्या मैं आपका नाम जान सकती हूँ?",
+        "name_after_other": "ज़रूर, नंबर भी ले लेंगे। पहले क्या मैं आपका नाम जान सकती हूँ?",
         "name_missed": "माफ़ कीजिए, मुझसे छूट गया। क्या आप एक बार फिर अपना नाम बता सकते हैं?",
         "name_updated": "ठीक है, {name} जी।",
         "no_caller_id": "माफ़ कीजिए, मुझे आपका नंबर दिखाई नहीं दे रहा। क्या आप अपना दस अंकों का मोबाइल नंबर बता सकते हैं?",
@@ -71,6 +76,7 @@ TEXTS: dict[str, dict[str, str]] = {
         "invalid_intl": "माफ़ कीजिए, यह नंबर सही नहीं लग रहा। क्या आप दोबारा बता सकते हैं? भारत के बाहर का नंबर हो तो country code से शुरू करें।",
         "skip_number": "कोई बात नहीं, नंबर अभी रहने देते हैं। क्या मैं आपकी और किसी चीज़ में मदद कर सकती हूँ?",
         "confirm": "एक बार कन्फ़र्म कर लूँ, आपका नंबर है {spoken}। क्या यह सही है?",
+        "thanks_confirm": "धन्यवाद {name} जी। एक बार कन्फ़र्म कर लूँ, आपका नंबर है {spoken}। क्या यह सही है?",
         "confirm_again": "माफ़ कीजिए, क्या {spoken} सही नंबर है? कृपया हाँ या ना बताइए।",
         "retry_digits": "कोई बात नहीं। क्या आप पूरा दस अंकों का नंबर दोबारा बता सकते हैं?",
         "saved_lead": "धन्यवाद {name} जी! आपकी जानकारी सेव हो गई है, {business} की टीम जल्द ही आपसे संपर्क करेगी। क्या मैं आपकी और किसी चीज़ में मदद कर सकती हूँ?",
@@ -84,8 +90,8 @@ _DEV_DIGITS = str.maketrans("०१२३४५६७८९", "0123456789")
 _DIGIT_WORDS = {
     "zero": "0", "oh": "0", "o": "0", "one": "1", "two": "2", "three": "3", "four": "4", "five": "5",
     "six": "6", "seven": "7", "eight": "8", "nine": "9",
-    "shunya": "0", "sunya": "0", "ek": "1", "do": "2", "teen": "3", "tin": "3", "char": "4", "chaar": "4",
-    "paanch": "5", "panch": "5", "chhe": "6", "che": "6", "chhah": "6", "saat": "7", "sat": "7",
+    "shunya": "0", "sunya": "0", "shoonya": "0", "shunyaa": "0", "sifar": "0", "ek": "1", "do": "2", "teen": "3", "tin": "3", "char": "4", "chaar": "4",
+    "paanch": "5", "panch": "5", "chhe": "6", "che": "6", "chhah": "6", "chah": "6", "chheh": "6", "chhaha": "6", "saat": "7", "sat": "7",
     # Not "no" for nau (9): "no no no" correcting a read-back became "999".
     "aath": "8", "ath": "8", "nau": "9",
     "शून्य": "0", "ज़ीरो": "0", "जीरो": "0", "एक": "1", "दो": "2", "तीन": "3", "चार": "4",
@@ -176,6 +182,17 @@ def name_from_history(user_texts: list[str]) -> str | None:
     return None
 
 
+def phone_from_history(user_texts: list[str], types=("mobile",)) -> str | None:
+    """A valid number the caller already said ("my number is 9822012345"), newest first."""
+    for t in reversed(user_texts[-6:]):
+        digits = extract_digits(t or "")
+        if len(digits) >= 10:
+            phone = clean_phone(digits[-10:], types) or clean_phone(digits, types)
+            if phone:
+                return phone
+    return None
+
+
 def spoken(digits: str) -> str:
     """'7677672641' -> '7 6 7 7 6 7 2 6 4 1' so TTS reads it digit by digit."""
     return " ".join(digits)
@@ -223,8 +240,12 @@ def extract_name(text: str) -> str | None:
     t = (text or "").strip()
     if not t or ALREADY_TOLD.search(t):
         return None  # "abhi tho bola" is "I already told you", not a name
-    if "?" in t:
-        return None  # "And what's FinanceAuditor?" was saved as a name
+    # "And what's FinanceAuditor?" was saved as a name: drop question sentences, but keep
+    # "This is Neha, 9811012345." in "This is Neha, 9811012345. What does Mill do?".
+    # Also split at commas: "मैं प्रिया बोल रही हूँ, आप लोग क्या करते हो?" keeps the name part.
+    t = " ".join(x for x in re.split(r"(?<=[.!।?,])\s+", t) if "?" not in x).strip(" ,")
+    if not t:
+        return None
     # Strip long numeric strings if caller provided digits in the same turn
     t_clean = re.sub(r"[\+\d\s-]{7,}", " ", t).strip()
     if not t_clean:
@@ -297,6 +318,8 @@ class ContactFlow:
         self.unclear = 0
         self.bad_numbers = 0
         self.caller_phone: str | None = None
+        self.wants_same: bool | None = None  # number choice given before the name
+        self.given_phone: str | None = None  # number the caller said before we asked
 
     @property
     def active(self) -> bool:
@@ -308,12 +331,14 @@ class ContactFlow:
 
     def start(
         self, tool: str, requirement: str | None, name: str | None, lang: str, caller: str | None,
-        opener: bool = True,
+        opener: bool = True, phone: str | None = None,
     ) -> str:
-        """First question. If name is already known, asks choice question immediately."""
+        """First question. If name is already known, asks choice question immediately.
+        phone: a number the caller already said ("my number is 98...") -> just confirm it."""
         self.reset()
         self.tool, self.requirement = tool, requirement
         self.caller_phone = caller
+        self.given_phone = phone
         if name:
             self.name = name
             return self._after_name(lang, caller)
@@ -373,6 +398,18 @@ class ContactFlow:
 
     def _after_name(self, lang: str, caller: str | None) -> str:
         self.unclear = 0
+        if self.given_phone:
+            # "मेरा नाम सुनील है, मेरा नंबर 9822012345 है": confirm that number, don't
+            # ask "this number or another?" (a "yes" there confirmed the caller ID instead).
+            self.phone, self.stage = self.given_phone, "confirm"
+            return self._t("thanks_confirm", lang, name=self.name or "", spoken=spoken(self.phone))
+        if self.wants_same and caller:
+            # They already said "इसी number पर" while we were asking the name.
+            self.phone, self.stage = caller, "confirm"
+            return self._t("confirm", lang, spoken=spoken(caller))
+        if self.wants_same is False:
+            self.stage, self.digits = "digits", ""
+            return self._t("ask_digits_named", lang, name=self.name or "")
         if caller:
             self.stage = "choice"
             return self._t("ask_choice", lang, name=self.name or "")
@@ -406,6 +443,11 @@ class ContactFlow:
                 return Step(say=self._t("confirm", lang, spoken=spoken(phone)))
             return Step(say=self._after_name(lang, caller))
 
+        # "इसी number पर call कर दीजिए" while we asked the name: they answered the next
+        # question early. Remember it and ask the name again, without "didn't catch it".
+        if not is_question and (DIFFERENT.search(text) or (SAME.search(text) and caller)):
+            self.wants_same = not DIFFERENT.search(text)
+            return Step(say=self._t("name_after_same" if self.wants_same else "name_after_other", lang))
         return self._unclear(lang, caller, "ask_name_again", is_question)
 
     def _on_choice(self, text: str, lang: str, caller: str | None, is_question: bool) -> Step:
@@ -492,6 +534,11 @@ class ContactFlow:
             self.stage, self.digits = "digits", ""
             return self._on_digits(text, lang, False)
         yes, no = bool(YES.search(text)), bool(NO.search(text))
+        # "इसी नंबर पर" / "same number" to "is this your number?" means yes, when the
+        # number being read back is the caller's own.
+        if not yes and not no and SAME.search(text) and not DIFFERENT.search(text) \
+                and self.phone and self.phone == self.caller_phone:
+            yes = True
         if yes and no:
             yes = bool(re.search(r"सही|correct|right", text, re.I))
             no = not yes

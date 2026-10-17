@@ -75,6 +75,10 @@ VAD_MIN_SPEECH_DURATION = float(os.getenv("VAD_MIN_SPEECH_DURATION", "0.3"))
 MIN_ENDPOINTING_DELAY = float(os.getenv("MIN_ENDPOINTING_DELAY", "0.4"))
 MAX_ENDPOINTING_DELAY = float(os.getenv("MAX_ENDPOINTING_DELAY", "1.0"))
 
+# Words the caller must say before Maya stops talking: a cough, line noise or a lone
+# "हाँ" no longer cuts her off. Stop words ("रुको", "wait") still stop her at once.
+MIN_INTERRUPTION_WORDS = int(os.getenv("MIN_INTERRUPTION_WORDS", "2"))
+
 # Seconds of caller silence before Maya checks "are you still there?".
 USER_AWAY_TIMEOUT_S = float(os.getenv("USER_AWAY_TIMEOUT_S", "20"))
 

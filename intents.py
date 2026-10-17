@@ -107,7 +107,9 @@ CALLBACK_WORDS = re.compile(
     r"(?:contact|talk|speak|connect)(?: with| to)? (?:the |your )?team|"
     # "उसका नंबर लिखो" / "take my number": the LLM said "नंबर नोट कर लिया" and saved nothing.
     r"(?:take|note|write)(?: down)? (?:my|his|her|the) number|number (?:likho|likh lo|note karo))\b"
-    r"|कॉल\s*बैक|वापस कॉल|कॉल कर(?:ना|ें|िए|ो)|संपर्क कर|नंबर (?:लिखो|लिख लो|लिखिए|नोट कर)",
+    r"|कॉल\s*बैक|वापस कॉल|कॉल कर(?:ना|ें|िए|ो)|संपर्क कर|नंबर (?:लिखो|लिख लो|लिखिए|नोट कर)"
+    # Sarvam writes "call"/"phone" in English: "इसी number पर call कर दीजिए".
+    r"|(?:call|phone|फ़ोन|फोन)\s*(?:कर|kar)\s*(?:दीजिए|दीजिये|दो|देना|लेना|लीजिए|dijiye|do|dena|lena|lijiye)",
     re.I,
 )
 
@@ -141,7 +143,7 @@ CONTACT_WORDS = re.compile(
 HUMAN = re.compile(
     r"\b(?:human|real person|a person|representative|someone from (?:the|your) team|team member|"
     r"manager|executive|customer care)\b|इंसान|असली (?:व्यक्ति|आदमी)|किसी (?:व्यक्ति|आदमी)|"
-    r"टीम (?:के किसी|से किसी|मेंबर)|मैनेजर|एग्ज़ीक्यूटिव",
+    r"टीम (?:के किसी|से किसी|मेंबर)|टीम से|टीम को|किसी से|मैनेजर|एग्ज़ीक्यूटिव|\bteam se\b|\bkisi se\b",
     re.I,
 )
 
@@ -164,6 +166,22 @@ OFFER = re.compile(
 GAVE_NAME = re.compile(
     r"\b(?:my name is|my name's|myself|mera naam|mera nam|merra naam)\b|मेरा नाम|मेरी नाम|"
     r"\b(?:bol raha|bol rahi) (?:hoon|hu|hun)\b|बोल रह[ाी] (?:हूँ|हूं)",
+    re.I,
+)
+
+# Maya's "would you like to know more?" question (counted to break the loop).
+MORE_INFO = re.compile(
+    r"\b(?:would you like to (?:know|learn|hear) more|want to know (?:more|how)|like to know (?:more|how)|"
+    r"interested in (?:learning|knowing|hearing) more)\b"
+    r"|जानना चाहेंगे|जानना चाहेंगी|और जानकारी चाहिए|के बारे में और जानना",
+    re.I,
+)
+
+# The LLM itself asked for the name ("क्या मैं आपका नाम जान सकती हूँ?"): the answer must
+# go to the contact flow, or the name is never saved.
+ASKED_NAME = re.compile(
+    r"\b(?:may i|can i|could i) (?:know|have|get|ask) your name|what(?:'s| is) your name|your good name\b"
+    r"|आपका नाम (?:जान|बता|क्या)|नाम जान सकत|अपना नाम बता",
     re.I,
 )
 
@@ -311,6 +329,14 @@ EMERGENCY = re.compile(
 
 # ---- Other ---------------------------------------------------------------------
 # Caller asks Maya to wait ("hold on", "ek minute"): the silence check-in waits longer.
+# Said while Maya is talking: stop speaking right away, whatever MIN_INTERRUPTION_WORDS is.
+STOP_NOW = re.compile(
+    r"(?:^|[^\wऀ-ॿ])(?:stop|wait|hold on|one (?:minute|second|sec)|excuse me|listen|"
+    r"ruko|rukiye|rukie|ek (?:minute|min|second|sec)|suno|suniye|sunie|"
+    r"रुको|रुकिए|रुकिये|एक मिनट|एक सेकंड|सुनो|सुनिए|सुनिये)(?=$|[^\wऀ-ॿ])",
+    re.I,
+)
+
 HOLD = re.compile(
     r"\b(?:hold on|wait a (?:minute|second|sec|moment)|please wait|one (?:minute|second|sec)|just a (?:minute|second|sec)|give me a (?:minute|second|sec)|"
     r"let me (?:check|see)|ek (?:minute|min|second|sec)|ruko|rukiye)\b|रुको|रुकिए|एक मिनट|एक सेकंड|देखता हूँ|देखती हूँ",

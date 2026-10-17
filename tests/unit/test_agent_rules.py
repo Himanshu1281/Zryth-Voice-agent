@@ -282,3 +282,55 @@ def test_volunteered_name(text, expected):
     from contact_flow import extract_name
     from intents import GAVE_NAME
     assert bool(GAVE_NAME.search(text) and extract_name(text)) == expected
+
+
+@pytest.mark.parametrize("text", ["इसी number पर call कर दीजिए", "phone kar dena", "मुझे फ़ोन कर दीजिए"])
+def test_callback_in_mixed_script(text):
+    from intents import CALLBACK_WORDS
+    assert CALLBACK_WORDS.search(text)
+
+
+@pytest.mark.parametrize("reply, expected", [
+    ("क्या मैं आपका नाम जान सकती हूँ?", True),
+    ("May I know your name?", True),
+    ("क्या आप जानना चाहेंगे कि यह कैसे काम करता है?", False),
+])
+def test_llm_asked_name(reply, expected):
+    from intents import ASKED_NAME
+    assert bool(ASKED_NAME.search(reply)) == expected
+
+
+@pytest.mark.parametrize("reply", ["क्या आप जानना चाहेंगे कि हम इसे कैसे स्वचालित कर सकते हैं?",
+                                   "Would you like to know more about how it works?"])
+def test_more_info_question(reply):
+    from intents import MORE_INFO
+    assert MORE_INFO.search(reply)
+
+
+# Real call 2026-10-09: two replies mid-call started with "नमस्ते!" again.
+@pytest.mark.parametrize("text, expected", [
+    ("नमस्ते! हम आपकी मदद कर सकते हैं।", "हम आपकी मदद कर सकते हैं।"),
+    ("नमस्ते अर्जुन जी, ज़रूर।", "ज़रूर।"),
+    ("Hello! We can help.", "We can help."),
+    ("Hindi में बात करें", "Hindi में बात करें"),
+    ("हम नमस्ते कहते हैं", "हम नमस्ते कहते हैं"),
+])
+def test_regreet_cut(text, expected):
+    from replies import REGREET
+    assert REGREET.sub("", text, count=1) == expected
+
+
+@pytest.mark.parametrize("text", ["टीम से बात करवा दीजिए", "team se baat karni hai", "किसी से बात करवाओ"])
+def test_talk_to_team_hindi(text):
+    from intents import HUMAN, TALK
+    assert HUMAN.search(text) and TALK.search(text)
+
+
+@pytest.mark.parametrize("text, expected", [
+    ("रुको रुको", True), ("एक मिनट", True), ("wait wait", True), ("hold on", True),
+    ("ruko na", True), ("सुनिए", True), ("excuse me", True),
+    ("हाँ", False), ("waiting for your call", False), ("नहीं रुकना", False), ("stopwatch", False),
+])
+def test_stop_words(text, expected):
+    from intents import STOP_NOW
+    assert bool(STOP_NOW.search(text)) == expected

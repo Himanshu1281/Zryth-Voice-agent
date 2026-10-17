@@ -101,6 +101,13 @@ EMERGENCY_LINE: dict[str, str] = {
     "hi": "यह इमरजेंसी लग रही है। कृपया तुरंत {number} पर कॉल करें।",
 }
 
+# The caller said yes to "would you like to know more?" twice and the LLM only asked it
+# again (6 times on a real call). Make the offer instead; a yes then starts the booking.
+MORE_INFO_OFFER: dict[str, str] = {
+    "en": "The best next step is {offer}, where our team works out the details for your exact need. Shall I book that for you?",
+    "hi": "इसके लिए सबसे अच्छा रहेगा {offer}, जिसमें हमारी टीम आपकी ज़रूरत के हिसाब से पूरी जानकारी देगी। क्या मैं इसे बुक कर दूँ?",
+}
+
 # Any later turn of an emergency call that isn't a question: the number again.
 EMERGENCY_REPEAT: dict[str, str] = {
     "en": "Please call {number} now, they can help you right away. Take care.",
@@ -138,6 +145,11 @@ JARGON: list = [
     (re.compile(r"नॉलेज\s*बेस में|knowledge base में"), "मेरी जानकारी में"),
     (re.compile(r"नॉलेज\s*बेस|knowledge base"), "जानकारी"),
 ]
+# A greeting at the start of a reply after the call's opening ("नमस्ते!", "Hello Arjun,").
+REGREET = re.compile(
+    r"^\s*(?:नमस्ते|नमस्कार|hello|hi|hey)(?:\s+[^\s!,.।?]+(?:\s+जी)?)?\s*[!,.।]\s*", re.I
+)
+
 # Words held back while streaming, so a phrase split across chunks is still caught.
 JARGON_HOLD_WORDS = 4
 

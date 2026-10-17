@@ -21,10 +21,10 @@ from livekit.agents import Agent, RunContext, function_tool
 
 from business import gendered
 from config import BCP47, SUPPORTED_LANGUAGES
-from contact_flow import extract_digits, extract_name, name_from_history
+from contact_flow import extract_digits, extract_name, name_from_history, phone_from_history
 from database import update_call_lead
 from intents import (
-    ACCEPT, ALREADY_TOLD, BOOKING_WORDS, CALLBACK_WORDS, CLEAR_GOODBYE, EMERGENCY, HOLD, GAVE_NAME, HUMAN, INTERESTED, NO, NOT_A_YES, OFFER, PROMISED,
+    ACCEPT, ALREADY_TOLD, ASKED_NAME, BOOKING_WORDS, CALLBACK_WORDS, CLEAR_GOODBYE, EMERGENCY, HOLD, GAVE_NAME, HUMAN, INTERESTED, MORE_INFO, NO, NOT_A_YES, OFFER, PROMISED,
     OFFICE_HOURS, QUESTION, SAME, TALK, TIME_OR_DATE, TOPIC, UNKNOWN_FACT, WANT, WHERE, YES,
 )
 from language import (
@@ -33,9 +33,9 @@ from language import (
 )
 from prompts import LANG_NAMES, STYLE_NOTES, build_instructions
 from replies import (
-    CALLBACK_OFFER, EMERGENCY_LINE, EMERGENCY_REPEAT, EMPTY_REPLY_FALLBACK, FILLERS, GENERIC_TOOL_FALLBACK, LENGTH_RULE, MARKDOWN,
+    CALLBACK_OFFER, EMERGENCY_LINE, MORE_INFO_OFFER, EMERGENCY_REPEAT, EMPTY_REPLY_FALLBACK, FILLERS, GENERIC_TOOL_FALLBACK, LENGTH_RULE, MARKDOWN,
     MAX_REPLY_CHARS, MAX_REPLY_SENTENCES, MIN_SENTENCE_WORDS, NO_TRANSFER, OFFICE_ADDRESS, OFFICE_HOURS_ASK, OFFICE_HOURS_SAVED,
-    JARGON_HOLD_WORDS, META_ASIDE, META_LOOKAHEAD, SAY_MARKER, SENTENCE_END, TOOL_REPLY_FALLBACK, office_address,
+    JARGON_HOLD_WORDS, META_ASIDE, REGREET, META_LOOKAHEAD, SAY_MARKER, SENTENCE_END, TOOL_REPLY_FALLBACK, office_address,
     repeats_earlier, scrub_jargon,
 )
 from routing import CallConfig
@@ -100,6 +100,10 @@ class BaseMayaAgent(Agent):
         held = ""   # text after the last space: a "." there may be "FinanceAuditor.ai"
         tail = None  # once `live` sentences are out, the rest is buffered here
         muted = False  # the model started an instruction-like aside: drop the rest
+        # After the opening greeting, hold the first characters of a reply so a repeated
+        # "नमस्ते!" / "Hello!" can be cut (Gemini greeted again twice in one call).
+        greeted = any(getattr(m, "role", None) == "assistant" for m in chat_ctx.items)
+        head = "" if greeted else None
         async for chunk in self._llm_node_inner(chat_ctx, tools, model_settings):
             if isinstance(chunk, str):
                 text = chunk
@@ -108,6 +112,11 @@ class BaseMayaAgent(Agent):
             else:
                 yield chunk  # tool call (or anything else): never cut
                 continue
+            if head is not None:
+                head += text
+                if len(head) < 24:
+                    continue
+                text, head = REGREET.sub("", head, count=1), None
             if muted:
                 continue
             if tail is not None:
@@ -155,6 +164,8 @@ class BaseMayaAgent(Agent):
                 held = buf[split:]
             else:
                 held = buf
+        if head:  # a reply shorter than the hold
+            held += REGREET.sub("", head, count=1)
         if tail is None:
             if held:
                 yield held
@@ -201,7 +212,13 @@ class BaseMayaAgent(Agent):
              if getattr(m, "role", None) == "user" and getattr(m, "type", None) == "message"),
             None,
         )
-        if self.kb is not None and last_msg is not None and last_msg.id not in self._seen_user_ids():
+        # Spoken turns (they carry an STT confidence) are left to on_user_turn_completed:
+        # LiveKit's preemptive generation calls llm_node BEFORE that hook, and handling the
+        # turn here too advanced the contact flow twice ("अर्जुन" -> name saved -> then
+        # "माफ़ कीजिए, इसी नंबर पर...?" as if "अर्जुन" had answered the number question).
+        spoken = getattr(last_msg, "transcript_confidence", None) is not None
+        if (self.kb is not None and last_msg is not None and not spoken
+                and last_msg.id not in self._seen_user_ids()):
             self._seen_user_ids().add(last_msg.id)
             await self._apply_profile()
             self._typed_turn = True
@@ -631,23 +648,45 @@ class BaseMayaAgent(Agent):
             bool(books(text) and WANT.search(text)) or bool(CALLBACK_WORDS.search(text))
             or bool(INTERESTED.search(text.strip()))
             # "मेरा नाम हिमांशु है" out of the blue: they want a callback.
-            or (bool(GAVE_NAME.search(text)) and bool(extract_name(text)) and self.kb.saved_contact is None)
+            # (not "मैं प्रिया बोल रही हूँ, आप लोग क्या करते हो?": answer the question first)
+            or (bool(GAVE_NAME.search(text)) and bool(extract_name(text)) and "?" not in text
+                and self.kb.saved_contact is None)
         )
         # "Okay thanks, bye" after an offer is a goodbye, not a yes.
         # "मैं कंसल्टेशन बुक कर रही हूँ" (no tool called, nothing saved) then "karo":
         # Gemini said "बुक कर दिया" without ever asking name or number.
         promised = bool(PROMISED.search(last_reply)) and self.kb.saved_contact is None
+        bare_name = (
+            extract_name(text) if len(text.split()) <= 3 and not (YES.search(text) or NO.search(text)) else None
+        )
         accepted = (
             bool(OFFER.search(last_reply) or books(last_reply)) and ("?" in last_reply or promised)
             and len(text.split()) <= 8
             # "इसी नंबर पर" / "same number" to "should our team call you?" is a yes too.
-            and bool(YES.search(text) or ACCEPT.search(text) or SAME.search(text))
+            # "सुनीता शर्मा" (just a name) to "क्या मैं इसे बुक कर दूँ?" is a yes too.
+            and bool(YES.search(text) or ACCEPT.search(text) or SAME.search(text) or bare_name)
             and not NO.search(text)
             and not NOT_A_YES.search(text)
         )
         # Asking for a person while live transfer is off: offer a callback instead.
         wants_human = bool(HUMAN.search(text) and TALK.search(text)) and not TRANSFER_ON
+        # Maya (the LLM) asked "क्या मैं आपका नाम जान सकती हूँ?" herself: whatever the caller
+        # answers goes to the contact flow, which saves the name and takes the number.
+        asked = asked or (
+            bool(ASKED_NAME.search(last_reply)) and self.kb.saved_contact is None
+            and not NO.search(text) and "?" not in text
+        )
         if not (asked or accepted or wants_human):
+            more_info_asks = sum(
+                1 for m in turn_ctx.items
+                if getattr(m, "role", None) == "assistant" and MORE_INFO.search(m.text_content or "")
+            )
+            if (more_info_asks >= 2 and MORE_INFO.search(last_reply) and self.kb.saved_contact is None
+                    and len(text.split()) <= 8 and bool(YES.search(text) or ACCEPT.search(text))
+                    and not NO.search(text)):
+                # "हाँ ज़रूर" to "क्या आप जानना चाहेंगे...?" for the third time: make the offer.
+                line = MORE_INFO_OFFER.get(self.code, MORE_INFO_OFFER["en"]).format(offer=self.kb.profile.offer(self.code))
+                self._reply_by_code(new_message, line)
             return
         # Demo/consultation -> booking; a callback ("call me back", or yes to "should our
         # team call you back?") -> lead.
@@ -671,12 +710,15 @@ class BaseMayaAgent(Agent):
             # "call me tomorrow morning": keep the slot they asked for.
             requirement = f"{requirement} (Preferred: {text.strip()})"
         known_name = (
-            getattr(self.kb, "known_name", None) or self.kb.contact.name
+            getattr(self.kb, "known_name", None) or self.kb.contact.name or bare_name
             or name_from_history(self._user_texts(turn_ctx, new_message))
         )
         log.info("%s started from code (asked=%s, accepted offer=%s, human=%s, name=%s)", tool, asked, accepted, wants_human, known_name)
+        # A number they already said ("my number is 9822012345") is confirmed, not re-asked.
+        given_phone = phone_from_history(self._user_texts(turn_ctx, new_message), self.kb.contact.phone_types)
         line = self.kb.contact.start(
-            tool, requirement, known_name, self.code, self.kb.clean_caller(), opener=not wants_human
+            tool, requirement, known_name, self.code, self.kb.clean_caller(), opener=not wants_human,
+            phone=given_phone,
         )
         if wants_human:
             line = NO_TRANSFER.get(self.code, NO_TRANSFER["en"]) + line

@@ -141,7 +141,8 @@ CASES: list[Case] = [
          save=False, end=True, forbid=[], note=''),
     Case('yes_to_everything', 'difficult', 'en',
          ['yes', 'yes', 'yes yes', 'sure', 'yes', 'Rahul', 'yes', 'yes', 'yes'],
-         save=False, end=None, forbid=[], note=''),
+         save=None, end=None, forbid=[],
+         note='Yes to everything: saving is fine once they accept the offer and give a name'),
     Case('number_chaos', 'difficult', 'en',
          [        'Book a demo for me',
          'Ankit',
@@ -604,4 +605,41 @@ CASES += [
          save=True, end=True,
          forbid=[r"नाम ठीक से सुनाई नहीं"],
          note="A demo request gets 'may I know your name', not 'didn't catch your name'"),
+]
+
+# Real call 2026-10-09 (RM_ncBCYFXRFk7V): "क्या आप जानना चाहेंगे...?" six times with yes
+# answers and no offer; then each contact step was handled twice (preemptive generation).
+CASES += [
+    Case("yes_loop_then_book", "core", "hi",
+         ["मेरा एक influencer account है, school के बच्चे message करते हैं, उसको automate करना है",
+          "हाँ बिल्कुल", "जी हाँ", "हाँ ज़रूर", "इसी number पर call कर दीजिए", "अर्जुन", "इसी नंबर पर", "हाँ", "नहीं"],
+         save=True, end=True,
+         forbid=[r"नाम ठीक से सुनाई नहीं", r"कृपया हाँ या ना"],
+         note="Yes to 'know more?' repeatedly leads to an offer, then name + number once each"),
+]
+
+# Caller gives name (and number) in the very first turn, before Maya asks anything.
+CASES += [
+    Case("upfront_name_number_en", "core", "en",
+         ["Hi, my name is Rohit Sharma and my number is 9876543210, I want a demo", "yes", "no, that's all"],
+         save=True, end=True, forbid=[r"may I know your name", r"ten-digit"],
+         expect_saved=r"demo|consultation",
+         note="Name + number + demo in the first turn: confirm the number, nothing re-asked"),
+    Case("upfront_name_number_hi", "core", "hi",
+         ["नमस्ते, मेरा नाम सुनील है, मेरा नंबर 9822012345 है, मुझे callback चाहिए", "हाँ", "नहीं बस"],
+         save=True, end=True, forbid=[r"नाम जान सकती", r"दस अंकों"],
+         note="Hindi: name + number + callback up front"),
+    Case("upfront_name_number_spoken_digits", "core", "hi",
+         ["main Amit bol raha hoon, mera number nau aath aath shoonya ek do teen chaar paanch chhah hai, call back kar dena",
+          "haan", "nahi"],
+         save=True, end=True, forbid=[r"नाम जान सकती|may I know your name"],
+         note="Romanized Hindi with digits spoken as words"),
+    Case("upfront_name_only", "core", "hi",
+         ["मैं प्रिया बोल रही हूँ, आप लोग क्या करते हो?", "अच्छा, मुझे consultation चाहिए", "इसी नंबर पर", "हाँ", "नहीं"],
+         save=True, end=True, forbid=[r"नाम जान सकती"],
+         note="Name volunteered with a question: no re-ask for the name"),
+    Case("upfront_name_number_then_question", "core", "en",
+         ["This is Neha, 9811012345. What does Mill Software do?", "okay, book a consultation then", "yes", "no thanks"],
+         save=True, end=True, forbid=[r"may I know your name", r"ten-digit"],
+         note="Name + number given early, booking asked later: reuse both"),
 ]

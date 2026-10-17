@@ -99,13 +99,35 @@ async def _settle(session, handle=None, deadline: float = 40.0) -> None:
     while time.perf_counter() < t_end:
         busy = (handle is not None and not handle.done()) or session.current_speech is not None
         idle = 0 if busy else idle + 1
-        if idle >= 8:
+        # 1.5 s quiet: in text mode a reply goes idle at a paragraph break, and
+        # 0.4 s cut the second paragraph (the question) off the history.
+        if idle >= 30:
             return
         await asyncio.sleep(0.05)
 
 
+# Imitate LiveKit's preemptive generation: llm_node runs on the caller's message
+# BEFORE on_user_turn_completed (its output is thrown away). Handling the turn in
+# both places advanced the contact flow twice on a real call. PREEMPTIVE=0 skips it.
+PREEMPTIVE = os.getenv("PREEMPTIVE", "1") != "0"
+
+
+async def _preemptive_pass(bot, msg: ChatMessage) -> None:
+    from livekit.agents.voice.agent import ModelSettings
+
+    ctx = bot.chat_ctx.copy()
+    ctx.items.append(msg)
+    try:
+        async for _ in bot.llm_node(ctx, list(bot.tools), ModelSettings()):
+            pass
+    except Exception:  # noqa: BLE001 - only its side effects matter
+        pass
+
+
 async def _voice_turn(session, bot, text: str) -> None:
     msg = ChatMessage(role="user", content=[text], transcript_confidence=0.9)
+    if PREEMPTIVE:
+        await _preemptive_pass(bot, msg)
     temp = bot.chat_ctx.copy()
     try:
         await bot.on_user_turn_completed(temp, new_message=msg)
@@ -117,6 +139,9 @@ async def _voice_turn(session, bot, text: str) -> None:
 
 
 def _reply_language(text: str) -> str:
+    # Brand names stay in English inside Hindi replies ("Zryth AI Labs & Software Studio
+    # की AI असिस्टेंट"): don't let them decide the language.
+    text = re.sub(r"\b(?:[A-Z][\w.&-]*\s*)+", " ", text)
     return "hi" if len(re.findall(r"[ऀ-ॿ]", text)) > len(re.findall(r"[A-Za-z]", text)) else "en"
 
 
@@ -167,7 +192,8 @@ async def run_case(case: Case, verbose: bool = True) -> Result:
             log(f"CALLER: {line}")
             for r in replies:
                 log(f"MAYA  : {r}")
-            want = language.detect_language(line)
+            # One word ("bye", "ok") doesn't set the language: Hindi callers say "bye" too.
+            want = language.detect_language(line) if len(line.split()) > 1 else None
             if replies and want and _reply_language(" ".join(replies)) != want:
                 mismatches += 1
                 log(f"   ^^ replied in {_reply_language(' '.join(replies))}, caller spoke {want}")

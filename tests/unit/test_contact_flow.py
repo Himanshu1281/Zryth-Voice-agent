@@ -194,3 +194,45 @@ def test_other_number_still_other():
     f, _ = flow("hi", name="Rakesh")
     turn = f.handle("दूसरे नंबर पर", "hi", CALLER)
     assert f.phone is None and "दस अंकों" in turn.say
+
+
+# Real call 2026-10-09: asked for the name, the caller said "इसी number पर call कर दीजिए";
+# Maya said "नाम ठीक से सुनाई नहीं दिया". Remember the choice, ask the name, then confirm.
+def test_number_choice_before_name():
+    f, _ = flow("hi")
+    first = f.handle("इसी number पर call कर दीजिए", "hi", CALLER).say
+    assert "सुनाई नहीं" not in first and "नाम" in first
+    confirm = f.handle("अर्जुन", "hi", CALLER).say
+    assert f.name == "अर्जुन" and f.phone == CALLER and "कन्फ़र्म" in confirm
+
+
+def test_other_number_before_name():
+    f, _ = flow("hi")
+    f.handle("दूसरे नंबर पर कॉल करना", "hi", CALLER)
+    ask = f.handle("अर्जुन", "hi", CALLER).say
+    assert f.stage == "digits" and "अर्जुन" in ask
+
+
+# Caller gives name + number before Maya asks (right after the greeting).
+def test_number_given_up_front_is_confirmed_not_reasked():
+    f = ContactFlow()
+    line = f.start("capture_lead", "x", "सुनील", "hi", CALLER, phone="9822012345")
+    assert f.stage == "confirm" and f.phone == "9822012345" and "9 8 2 2" in line and "सुनील" in line
+
+
+@pytest.mark.parametrize("text, name, phone", [
+    ("This is Neha, 9811012345. What does Mill Software do?", "Neha", "9811012345"),
+    ("मैं प्रिया बोल रही हूँ, आप लोग क्या करते हो?", "प्रिया", None),
+    ("main Amit bol raha hoon, mera number nau aath aath shoonya ek do teen chaar paanch chhah hai", "Amit", "9880123456"),
+    ("Okay, what is the price?", None, None),
+])
+def test_name_and_number_from_first_turn(text, name, phone):
+    from contact_flow import phone_from_history
+    assert extract_name(text) == name and phone_from_history([text]) == phone
+
+
+def test_same_number_at_confirm_is_a_yes():
+    f, _ = flow("hi", name="अर्जुन")
+    f.handle("इसी नंबर पर", "hi", CALLER)          # -> confirm caller ID
+    assert f.stage == "confirm"
+    assert f.handle("इसी नंबर पर", "hi", CALLER).save
