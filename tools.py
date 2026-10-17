@@ -15,6 +15,7 @@ from livekit.agents import JobContext, RunContext, function_tool
 from livekit.agents.beta.workflows import WarmTransferTask
 
 from business import BusinessProfile, build_profile, cached_profile
+from config import VENDOR_NUMBERS
 from contact_flow import ContactFlow, clean_phone, name_from_history
 from intents import (
     ACK, BOOKING_WORDS, CALLBACK_WORDS, CONTACT_WORDS, GOODBYE, OFFER, PRICING_QUESTION, SHORT_NO, SIGNOFF, SMALL_TALK,
@@ -23,6 +24,7 @@ from replies import CALLBACK_OFFER, GOODBYES, TRANSFER_FAILED_LINES, speak
 from routing import DEFAULT_CONFIG, CallConfig
 from database import log_knowledge_gap, update_call_lead
 from dynamic_executor import execute_tool_call, is_executable
+from vendor import VendorStats
 
 # Initialize the Gemini client for embeddings
 if os.getenv('CI') or os.getenv('GITHUB_ACTIONS'):
@@ -479,6 +481,13 @@ class AppointmentTools:
         self.callback_offered = False
         # time.monotonic() of the caller's last "hold on" (silence check waits longer).
         self.hold_requested_at: float | None = None
+        # Vendor mode (vendor.py): timings and questions asked on a sales bot's call.
+        self.vendor_stats = VendorStats()
+
+    @property
+    def vendor(self) -> bool:
+        """A vendor's sales bot is calling (VENDOR_NUMBERS): Maya asks, never sells."""
+        return bool(self.caller_phone) and self.caller_phone[-10:] in VENDOR_NUMBERS
 
     def set_profile(self, profile: BusinessProfile) -> None:
         self.profile = profile
@@ -555,6 +564,9 @@ class AppointmentTools:
         which agent.llm_node says word for word."""
         lang = getattr(context.session.current_agent, "code", "en")
         caller = self.clean_caller()
+        if self.vendor:
+            log.info("%s: refused, vendor call", tool)
+            return "Not started: this is a vendor's sales agent. Don't take details; ask your next question."
         if self.saved_contact is not None:
             log.info("%s: details already saved this call", tool)
             return ("Not started: the caller's details are already saved and the team will contact them. "

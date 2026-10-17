@@ -23,6 +23,7 @@ from business import gendered
 from config import BCP47, SUPPORTED_LANGUAGES
 from contact_flow import extract_digits, extract_name, introduced_name, name_from_history, phone_from_history
 from database import update_call_lead
+from vendor import vendor_note
 from intents import (
     ACCEPT, ALREADY_TOLD, ASKED_NAME, BOOKING_WORDS, CALLBACK_WORDS, CLEAR_GOODBYE, DIFFERENT, EMERGENCY, HOLD, GAVE_NAME, HUMAN, INTERESTED, MORE_INFO, NO, NOT_A_YES, OFFER, PROMISED,
     OFFICE_HOURS, QUESTION, SAME, TALK, TIME_OR_DATE, TOPIC, UNKNOWN_FACT, WANT, WHERE, YES,
@@ -211,7 +212,16 @@ class BaseMayaAgent(Agent):
                 role="system",
                 content=f"The caller's name is {known}. Use it now and then (not every reply); never ask for it.",
             )
-        if self.kb is not None and self.kb.saved_contact is not None:
+        if self.kb is not None and self.kb.vendor:
+            # One question per caller turn (llm_node also runs for retries: count once).
+            stats = self.kb.vendor_stats
+            turn = next((m for m in reversed(chat_ctx.items) if getattr(m, "role", None) == "user"), None)
+            turn_id = getattr(turn, "id", None)
+            if turn_id is not None and turn_id != getattr(self, "_vendor_turn", None):
+                self._vendor_turn = turn_id
+                stats.asked += 1
+            chat_ctx.add_message(role="system", content=vendor_note(max(stats.asked - 1, 0)))
+        elif self.kb is not None and self.kb.saved_contact is not None:
             # After saving, Maya asked "would you like our team to call you back?" again.
             chat_ctx.add_message(
                 role="system",
@@ -518,6 +528,11 @@ class BaseMayaAgent(Agent):
         if intro and intro != self.kb.known_name:
             log.info("Caller introduced themselves: %s", intro)
             self.kb.known_name = intro
+        if self.kb.vendor:
+            # A sales bot: no contact flow, offers or callbacks; only hang up on a sign-off.
+            if CLEAR_GOODBYE.search(text) and "?" not in text:
+                self._reply_by_code(new_message, goodbye=True)
+            return
         last_reply = next(
             (m.text_content or "" for m in reversed(turn_ctx.items)
              if getattr(m, "role", None) == "assistant" and m.text_content),

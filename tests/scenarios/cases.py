@@ -680,9 +680,26 @@ CASES += [
           "That is such a smart mission. What is the most time consuming workflow you handle when bringing on new clients?",
           "A free discovery audit sounds like a fantastic idea. Shall I note down your details?",
           "This number works perfectly.",
-          "That is correct. 7965813925. Our team will be in touch with you shortly on this number.",
+          "That is correct. 7677672641. Our team will be in touch with you shortly on this number.",
           "Everything is all set. Thank you so much. Have a wonderful day ahead."],
          end=True, forbid=[r"\bAll\b[,.!]", r"call you back", r"(?i)may I know your name"],
-         caller="07965813925", expect=[r"Kixie"],
+         expect=[r"Kixie"],
          note="Vendor bot: right name, number confirmed once, no callback re-offer, hangs up on sign-off"),
+]
+
+# The same bot from its real number (VENDOR_NUMBERS): vendor mode. Maya asks buyer
+# questions (vendor.QUESTIONS) and never pitches, books or takes details.
+CASES += [
+    Case("vendor_mode_kixie", "core", "en",
+         ["This is Kixie from Kixie.ai and yes, I am the AI you just summoned. Pretty cool, right?",
+          "We are an omnichannel AI automation platform. Our AI voice calls and WhatsApp engage leads instantly and qualify them.",
+          "We support English and Hindi, and yes we switch mid call.",
+          "Voice, WhatsApp and SMS. A lead that doesn't pick up gets a WhatsApp follow-up.",
+          "We integrate with HubSpot, Zoho and Salesforce. Hot leads go to your sales team on WhatsApp.",
+          "Shall I note down your details and have our team call you?",
+          "Great. Thank you so much. Have a wonderful day ahead."],
+         save=False, end=True, caller="07965813925",
+         forbid=[r"(?i)may I know your name", r"(?i)call you back|callback", r"(?i)consultation|discovery audit", r"(?i)your number is"],
+         expect=[r"(?i)language", r"(?i)channel|WhatsApp|SMS", r"(?i)CRM|integrat"],
+         note="Vendor bot: buyer questions in order, no pitch/booking/details"),
 ]

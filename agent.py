@@ -86,6 +86,7 @@ from maya import GreeterAgent
 from replies import NUMBER_NOT_ACTIVE
 from routing import CallConfig, resolve_call_config
 from tools import AppointmentTools, build_dynamic_tools, call_outcome, summarize_transcript
+from vendor import vendor_report
 
 from database import (
     create_call,
@@ -411,6 +412,15 @@ async def entrypoint(ctx: JobContext) -> None:
             text = getattr(item, "text_content", None)
             if role in ("user", "assistant") and text:
                 lines.append(f"{'Caller' if role == 'user' else 'Maya'}: {text}")
+        if tools_instance.vendor:
+            # The report (their answers, timings, what to improve) is the call's summary.
+            report = await vendor_report("\n".join(lines), tools_instance.vendor_stats, LLM_MODEL)
+            log.info("Vendor report:\n%s", report)
+            try:
+                await asyncio.to_thread(save_call_summary, call_id, report or "", "vendor_pitch", "vendor_pitch")
+            except Exception:
+                log.exception("Failed to save vendor report")
+            return
         result = await summarize_transcript("\n".join(lines), LLM_MODEL,
                                             tools_instance.profile.name, tools_instance.profile.persona)
         if result:
@@ -538,6 +548,11 @@ async def entrypoint(ctx: JobContext) -> None:
     session.on("agent_state_changed", on_agent_state_changed)
     tools_instance.on_end_requested = lambda: asyncio.create_task(_hang_up_fallback())
     tools_instance.caller_phone = phone
+    if tools_instance.vendor:
+        # A vendor's sales bot (vendor.py): time both agents for the post-call report.
+        log.info("Vendor call from %s: buyer-question mode", phone)
+        session.on("agent_state_changed", lambda ev: tools_instance.vendor_stats.on_agent_state(ev.new_state))
+        session.on("user_state_changed", lambda ev: tools_instance.vendor_stats.on_user_state(ev.new_state))
 
     await session.start(
         agent=GreeterAgent(caller_phone=phone, kb=tools_instance, language=config.language),
