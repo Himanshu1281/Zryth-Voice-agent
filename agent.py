@@ -65,6 +65,7 @@ from intents import STOP_NOW
 from config import (
     AUDIO_SAMPLE_RATE,
     MIN_INTERRUPTION_WORDS,
+    VENDOR_NUMBERS,
     BCP47,
     DEFAULT_LANGUAGE,
     MAX_ENDPOINTING_DELAY,
@@ -419,7 +420,8 @@ async def entrypoint(ctx: JobContext) -> None:
                     call_id,
                     result.get("summary", ""),
                     result.get("intent"),
-                    call_outcome(result.get("outcome"), tools_instance.saved_tool),
+                    call_outcome(result.get("outcome"), tools_instance.saved_tool,
+                                 vendor=(tools_instance.caller_phone or "")[-10:] in VENDOR_NUMBERS),
                 )
             except Exception:
                 log.exception("Failed to save call summary")

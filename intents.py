@@ -199,7 +199,8 @@ PROMISED = re.compile(
 # The caller is clearly ending the call (not just "thanks" mid-conversation).
 CLEAR_GOODBYE = re.compile(
     r"\b(?:bye|goodbye|that'?s all|that is all|no thanks?|nothing else|that'?s it|i'?m done|"
-    r"wrong number|galti se|nahi bas|bas itna(?: hi)?|aur kuch nahi)\b"
+    r"wrong number|galti se|nahi bas|bas itna(?: hi)?|aur kuch nahi|"
+    r"(?:everything|we) (?:is|are|'?s|'?re) all set|have a (?:good|great|nice|wonderful|lovely|fantastic) (?:day|evening|one)|take care)\b"
     # A reply that is only "thanks" ("ठीक है धन्यवाद", "ok thank you") is a sign-off.
     r"|^\W*(?:(?:ok(?:ay)?|ठीक है|theek hai|accha|अच्छा)\W*)?(?:thanks?|thank you|धन्यवाद|शुक्रिया|dhanyavaad|shukriya)\W*$"
     r"|बाय|बस इतना|और कुछ नहीं|अलविदा|फ़ोन रखता|फोन रखता|रखती हूँ|रखता हूँ|गलती से|ग़लती से|गलत नंबर",

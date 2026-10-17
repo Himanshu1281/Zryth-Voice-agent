@@ -74,6 +74,7 @@ class Case:
     expect: list[str] = field(default_factory=list)  # regexes Maya must say somewhere in the call
     expect_saved: str | None = None  # regex the saved requirement must match ("Appointment request")
     allow_prices: bool = False  # the business lists prices, so quoting them is right
+    caller: str = CALLER       # the number the call comes from
 
 
 @dataclass
@@ -163,12 +164,12 @@ async def run_case(case: Case, verbose: bool = True) -> Result:
             cfg = CallConfig(org_agent_id=KB_AGENT_ID, language=case.lang)
             kb = tools.AppointmentTools(job_ctx=SimpleNamespace(shutdown=lambda **k: None), call_id=TEST_CALL_ID, config=cfg)
             await kb.prepare_kb()
-        kb.caller_phone = CALLER
+        kb.caller_phone = case.caller
         ended = {"v": False}
         kb.on_end_requested = lambda: ended.__setitem__("v", True)
 
         session = AgentSession(llm=agent._build_llm(), tools=kb.to_tools())
-        bot = maya.GreeterAgent(caller_phone=CALLER, kb=kb, language=case.lang)
+        bot = maya.GreeterAgent(caller_phone=case.caller, kb=kb, language=case.lang)
         await session.start(agent=bot)
         seen = 0
         transcript, errors, mismatches = [], [], 0

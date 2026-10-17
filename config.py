@@ -79,6 +79,12 @@ MAX_ENDPOINTING_DELAY = float(os.getenv("MAX_ENDPOINTING_DELAY", "1.0"))
 # "हाँ" no longer cuts her off. Stop words ("रुको", "wait") still stop her at once.
 MIN_INTERRUPTION_WORDS = int(os.getenv("MIN_INTERRUPTION_WORDS", "2"))
 
+# Numbers of vendors' sales bots (Kixie.ai: 7965813925). Their calls are tagged
+# "vendor_pitch", never counted as leads. Comma-separated, last 10 digits are compared.
+VENDOR_NUMBERS = {
+    n.strip()[-10:] for n in os.getenv("VENDOR_NUMBERS", "7965813925").split(",") if n.strip()
+}
+
 # Seconds of caller silence before Maya checks "are you still there?".
 USER_AWAY_TIMEOUT_S = float(os.getenv("USER_AWAY_TIMEOUT_S", "20"))
 

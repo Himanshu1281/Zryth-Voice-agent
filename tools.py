@@ -239,13 +239,17 @@ _SUMMARY_PROMPT = (
     "Summarise this phone call between {persona} ({business}'s voice assistant) and a caller. "
     'Return JSON only: {"summary": "2-3 sentences", "intent": "short label, e.g. '
     'product_enquiry / pricing / custom_dev / support / other", "outcome": "one of '
-    'lead_captured, consultation_booked, transferred, answered, unresolved, dropped"}.\n\n'
+    'lead_captured, consultation_booked, transferred, answered, unresolved, dropped, vendor_pitch '
+    '(the caller was selling their own product or service to {business})"}.\n\n'
 )
 
 
-def call_outcome(llm_outcome: str | None, saved_tool: str | None) -> str | None:
+def call_outcome(llm_outcome: str | None, saved_tool: str | None, vendor: bool = False) -> str | None:
     """The dashboard outcome: what the code actually saved, not what the summary LLM
     guessed (a call with no lead was marked "lead_captured")."""
+    # Kixie.ai's sales bot "booked a consultation" with Maya: a pitch is never a lead.
+    if vendor or llm_outcome == "vendor_pitch":
+        return "vendor_pitch"
     if saved_tool:
         return "consultation_booked" if saved_tool == "book_consultation" else "lead_captured"
     if llm_outcome in ("lead_captured", "consultation_booked"):
@@ -553,7 +557,8 @@ class AppointmentTools:
         caller = self.clean_caller()
         if self.saved_contact is not None:
             log.info("%s: details already saved this call", tool)
-            return None
+            return ("Not started: the caller's details are already saved and the team will contact them. "
+                    "Say so in one short sentence; don't offer a callback again.")
         if self.contact.active:
             # The LLM called again mid-flow: just repeat the pending question.
             return speak(self.contact.question(lang, caller))

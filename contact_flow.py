@@ -170,16 +170,40 @@ _NOT_NAMES = {
     "हाँ", "हां", "नहीं", "नही", "ठीक", "सही", "गलत", "नमस्ते", "हेलो"
 }
 
+# "I'm ..." words that describe the caller, not name them.
+_STATE_WORDS = {"all", "ears", "set", "ready", "here", "listening", "done", "interested", "looking", "back"}
+
 
 def name_from_history(user_texts: list[str]) -> str | None:
     """A name the caller already gave earlier ("merra name Himanshu hai" to the LLM),
     newest first. Only explicit introductions count, not any short reply."""
-    for t in reversed(user_texts[-6:]):
-        if any(p.search(t or "") for p in _NAME_PATTERNS[:5]):
-            name = extract_name(t)
-            if name:
-                return name
+    # The whole call, not the last few turns: a name said in the first sentence was
+    # forgotten by the time the caller asked for a booking 8 turns later.
+    for t in reversed(user_texts):
+        name = introduced_name(t)
+        if name:
+            return name
     return None
+
+
+# An explicit introduction anywhere in a turn. Stricter than _NAME_PATTERNS: no bare
+# "I'm ..." ("I'm looking for a clinic"), since this runs on every caller turn.
+_INTRO = re.compile(
+    r"\b(?:my name is|my name's|name is|this is|myself)\b|"
+    r"\b(?:mera|merra|meraa|meri|humara)\s*(?:naam|nam|name)\b|मेरा नाम|मेरी नाम|हमारा नाम|"
+    r"\b(?:bol raha|bol rahi|baat kar raha|baat kar rahi) (?:hoon|hu|hun)\b|"
+    r"बोल रह[ाी] (?:हूँ|हूं)|बात कर रह[ाी] (?:हूँ|हूं)|\b(?:here|speaking|this side)\s*[,.!।]",
+    re.I,
+)
+
+
+def introduced_name(text: str) -> str | None:
+    """The caller's name if this turn introduces them ("Hi, this is Ravi", "मैं सुनील बोल
+    रहा हूँ"), else None. Safe to run on every turn."""
+    t = text or ""
+    if not _INTRO.search(t):
+        return None
+    return extract_name(t)
 
 
 def phone_from_history(user_texts: list[str], types=("mobile",)) -> str | None:
@@ -238,8 +262,10 @@ def extract_digits(text: str) -> str:
 def extract_name(text: str) -> str | None:
     """Extract caller name reliably across English, Hindi and Romanized Hindi."""
     t = (text or "").strip()
-    if not t or ALREADY_TOLD.search(t):
-        return None  # "abhi tho bola" is "I already told you", not a name
+    if not t or (ALREADY_TOLD.search(t) and len(t.split()) <= 6):
+        # "abhi tho bola" is "I already told you", not a name. Short replies only: it
+        # matches a bare "already" ("you are already talking to the product").
+        return None
     # "And what's FinanceAuditor?" was saved as a name: drop question sentences, but keep
     # "This is Neha, 9811012345." in "This is Neha, 9811012345. What does Mill do?".
     # Also split at commas: "मैं प्रिया बोल रही हूँ, आप लोग क्या करते हो?" keeps the name part.
@@ -265,6 +291,9 @@ def extract_name(text: str) -> str | None:
 
     if candidate is None:
         candidate = t_clean
+    # "This is Kixie. Pretty cool that..." became "Kixie. Pretty Cool" (or nothing): a
+    # name ends at the sentence.
+    candidate = re.split(r"[.!।?,;]\s", candidate)[0]
 
     candidate = _STOP_PAT.sub("", candidate).strip(" .,।!?\"'")
     candidate = _FILLERS_PAT.sub("", candidate).strip(" .,।!?\"'")
@@ -278,6 +307,8 @@ def extract_name(text: str) -> str | None:
     # Reject if single word is a filler / generic word
     if len(words) == 1 and words[0].lower() in _NOT_NAMES:
         return None
+    if any(w.lower() in _STATE_WORDS for w in words):
+        return None  # "I'm all ears" / "I'm all set" (Kixie.ai's bot was saved as "All")
     if any(w.lower() in ("what", "how", "why", "when", "kya", "kaise", "kyun") for w in words):
         return None
 
@@ -530,7 +561,10 @@ class ContactFlow:
         return Step(say=self._t(key, lang))
 
     def _on_confirm(self, text: str, lang: str, is_question: bool) -> Step:
-        if extract_digits(text):
+        digits = extract_digits(text)
+        if digits and self.phone and digits[-10:] == self.phone[-10:] and not NO.search(text):
+            return Step(save=True)  # "That is correct. 7965813925": the number read back
+        if digits:
             self.stage, self.digits = "digits", ""
             return self._on_digits(text, lang, False)
         yes, no = bool(YES.search(text)), bool(NO.search(text))

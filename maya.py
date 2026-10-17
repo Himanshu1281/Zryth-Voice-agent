@@ -21,10 +21,10 @@ from livekit.agents import Agent, RunContext, function_tool
 
 from business import gendered
 from config import BCP47, SUPPORTED_LANGUAGES
-from contact_flow import extract_digits, extract_name, name_from_history, phone_from_history
+from contact_flow import extract_digits, extract_name, introduced_name, name_from_history, phone_from_history
 from database import update_call_lead
 from intents import (
-    ACCEPT, ALREADY_TOLD, ASKED_NAME, BOOKING_WORDS, CALLBACK_WORDS, CLEAR_GOODBYE, EMERGENCY, HOLD, GAVE_NAME, HUMAN, INTERESTED, MORE_INFO, NO, NOT_A_YES, OFFER, PROMISED,
+    ACCEPT, ALREADY_TOLD, ASKED_NAME, BOOKING_WORDS, CALLBACK_WORDS, CLEAR_GOODBYE, DIFFERENT, EMERGENCY, HOLD, GAVE_NAME, HUMAN, INTERESTED, MORE_INFO, NO, NOT_A_YES, OFFER, PROMISED,
     OFFICE_HOURS, QUESTION, SAME, TALK, TIME_OR_DATE, TOPIC, UNKNOWN_FACT, WANT, WHERE, YES,
 )
 from language import (
@@ -203,6 +203,31 @@ class BaseMayaAgent(Agent):
             await self._switch_language(lang)
             chat_ctx.add_message(
                 role="system", content=f"The caller is now speaking {LANG_NAMES[lang]}; reply in {LANG_NAMES[lang]}."
+            )
+        known = getattr(self.kb, "known_name", None) if self.kb is not None else None
+        if known:
+            # Without this the LLM used the name only if it noticed it in the history.
+            chat_ctx.add_message(
+                role="system",
+                content=f"The caller's name is {known}. Use it now and then (not every reply); never ask for it.",
+            )
+        if self.kb is not None and self.kb.saved_contact is not None:
+            # After saving, Maya asked "would you like our team to call you back?" again.
+            chat_ctx.add_message(
+                role="system",
+                content="The caller's details are already saved and the team will contact them. "
+                        "Never offer a callback, consultation or booking again.",
+            )
+        more_info_asks = sum(
+            1 for m in chat_ctx.items
+            if getattr(m, "role", None) == "assistant" and MORE_INFO.search(m.text_content or "")
+        )
+        if more_info_asks >= 2:
+            # It came back even after MORE_INFO_OFFER, whenever the caller replied with a question.
+            chat_ctx.add_message(
+                role="system",
+                content="You have already asked whether the caller would like to know more. Never ask that again: "
+                        "just answer, and end with a different short question or none.",
             )
         # Typed input (console) skips on_user_turn_completed, so the name/phone steps,
         # booking starts and goodbyes never ran there: the LLM "noted" names it never
@@ -487,6 +512,12 @@ class BaseMayaAgent(Agent):
         """Turns decided by code, not the LLM: the name/phone steps, hanging up once
         details are saved, and starting the steps on a clear request. Raises (via
         _reply_by_code) when code answers; returns when the LLM should reply."""
+        # Remember the name the moment it's said ("Hi, this is Ravi"), so booking later
+        # asks only for the number. A later introduction is a correction and wins.
+        intro = introduced_name(text) if not self.kb.contact.active else None
+        if intro and intro != self.kb.known_name:
+            log.info("Caller introduced themselves: %s", intro)
+            self.kb.known_name = intro
         last_reply = next(
             (m.text_content or "" for m in reversed(turn_ctx.items)
              if getattr(m, "role", None) == "assistant" and m.text_content),
@@ -716,6 +747,10 @@ class BaseMayaAgent(Agent):
         log.info("%s started from code (asked=%s, accepted offer=%s, human=%s, name=%s)", tool, asked, accepted, wants_human, known_name)
         # A number they already said ("my number is 9822012345") is confirmed, not re-asked.
         given_phone = phone_from_history(self._user_texts(turn_ctx, new_message), self.kb.contact.phone_types)
+        if not given_phone and SAME.search(text) and not DIFFERENT.search(text):
+            # "इसी नंबर पर" as the request itself: confirm the caller's number, don't ask
+            # "this number or another?" right after they answered it.
+            given_phone = self.kb.clean_caller()
         line = self.kb.contact.start(
             tool, requirement, known_name, self.code, self.kb.clean_caller(), opener=not wants_human,
             phone=given_phone,
@@ -734,6 +769,13 @@ class BaseMayaAgent(Agent):
         if kb.contact.stage == "name" and not kb.contact.name and ALREADY_TOLD.search(text):
             # "abhi tho bola": they gave it to the LLM earlier; find it instead of re-asking.
             kb.contact.name = kb.known_name or name_from_history(self._user_texts(turn_ctx, new_message))
+        own = kb.profile.booking_regex
+        if (BOOKING_WORDS.search(text) or (own and own.search(text))) and WANT.search(text) \
+                and not extract_digits(text):
+            # "मुझे कंसल्टेशन बुक करना है" while confirming a callback number: it counted as
+            # an unclear answer, the flow gave up, and the next "इसी नंबर पर" started over.
+            kb.contact.tool, kb.contact.unclear = "book_consultation", 0
+            self._reply_by_code(new_message, kb.contact._t("sure", self.code) + kb.contact.question(self.code, caller))
         step = kb.contact.handle(
             text, self.code, caller, is_question=bool(QUESTION.search(text)) and not re.search(r"\d", text)
         )

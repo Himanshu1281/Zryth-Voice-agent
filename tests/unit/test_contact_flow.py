@@ -10,6 +10,7 @@ from contact_flow import (
     clean_phone,
     extract_digits,
     extract_name,
+    introduced_name,
     name_from_history,
 )
 
@@ -236,3 +237,70 @@ def test_same_number_at_confirm_is_a_yes():
     f.handle("इसी नंबर पर", "hi", CALLER)          # -> confirm caller ID
     assert f.stage == "confirm"
     assert f.handle("इसी नंबर पर", "hi", CALLER).save
+
+
+# --------------------------------------------------------- name said early in the call
+@pytest.mark.parametrize("text, expected", [
+    ("Hi, this is Ravi", "Ravi"),
+    ("my name is Priya, what do you do?", "Priya"),
+    ("मेरा नाम सुनील है", "सुनील"),
+    ("मैं सुनील बोल रहा हूँ", "सुनील"),
+    ("Ravi here, I wanted to ask about pricing", "Ravi"),
+])
+def test_introduced_name(text, expected):
+    assert introduced_name(text) == expected
+
+
+@pytest.mark.parametrize("text", [
+    "I'm looking for a clinic near me",
+    "hello",
+    "what is this?",
+    "क्या आप OPD बुक करते हैं?",
+])
+def test_not_an_introduction(text):
+    assert introduced_name(text) is None
+
+
+def test_name_from_first_turn_survives_long_call():
+    # The name was said in turn 1; booking was asked in turn 9 (was a 6-turn window).
+    texts = ["Hi, this is Ravi"] + ["what are your timings?"] * 8
+    assert name_from_history(texts) == "Ravi"
+
+
+def test_known_name_skips_name_question():
+    f, first = flow(name="Ravi")
+    assert "name" not in first.lower()
+    assert f.stage == "choice"
+
+
+@pytest.mark.parametrize("text", ["main interested hoon", "मैं परेशान हूँ", "main bimar hoon"])
+def test_main_x_hoon_is_not_a_name(text):
+    # Runs on every turn: "मैं परेशान हूँ" must not make the caller "परेशान".
+    assert introduced_name(text) is None
+
+
+# ------------------------------------------- Kixie.ai's sales bot call, 2026-10-17
+@pytest.mark.parametrize("text", ["Take your time. I'm all ears", "I'm all set", "I'm here"])
+def test_filler_phrases_are_not_names(text):
+    assert extract_name(text) is None
+
+
+def test_confirm_with_same_digits_is_yes():
+    # "That is correct. 7965813925." was re-read as a new number and confirmed twice.
+    f, _ = flow(name="Kixie", caller="7965813925")
+    f.handle("this number", "en", "7965813925")
+    assert f.stage == "confirm"
+    assert f.handle("That is correct. 7965813925.", "en", "7965813925").save
+
+
+def test_confirm_with_other_digits_is_not_yes():
+    f, _ = flow(name="Kixie", caller="7965813925")
+    f.handle("this number", "en", "7965813925")
+    assert not f.handle("no, 9822012345", "en", "7965813925").save
+
+
+def test_name_stops_at_sentence_end():
+    t = ("This is Kixie from Kixie.ai and yes, I am the AI you just summoned. "
+         "Pretty cool that you are already talking to the product, right?")
+    assert introduced_name(t) == "Kixie"
+    assert extract_name("This is Kixie. Pretty cool") == "Kixie"

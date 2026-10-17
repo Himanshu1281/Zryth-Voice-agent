@@ -643,3 +643,46 @@ CASES += [
          save=True, end=True, forbid=[r"may I know your name", r"ten-digit"],
          note="Name + number given early, booking asked later: reuse both"),
 ]
+
+# Name said in the first turn, booking asked many turns later (the old 6-turn window
+# forgot it and Maya asked "may I know your name?" again).
+CASES += [
+    Case("early_name_late_booking_en", "core", "en",
+         ["Hi, this is Karan", "what services do you offer?", "okay", "how does it work?", "hmm okay",
+          "do you work with small businesses?", "nice", "book a consultation please", "yes, this number", "yes", "no, that's all"],
+         save=True, end=True, forbid=[r"may I know your name", r"your name"],
+         note="Name from turn 1 is reused at booking; only the number is asked"),
+    Case("early_name_late_booking_hi", "core", "hi",
+         ["नमस्ते, मेरा नाम दीपक है, आप लोग क्या करते हो?", "अच्छा", "कैसे काम करता है?", "ठीक है",
+          "छोटे बिज़नेस के लिए भी है?", "बढ़िया", "मुझे कंसल्टेशन बुक करना है", "इसी नंबर पर", "हाँ", "नहीं बस"],
+         save=True, end=True, forbid=[r"नाम जान सकती", r"अपना नाम"],
+         note="Hindi: name from turn 1 reused at booking"),
+]
+
+# Live run 2026-10-17: a booking request while confirming a callback number counted as
+# "unclear", the flow gave up, and "इसी नंबर पर" restarted it at "this number or another?".
+CASES += [
+    Case("booking_during_callback_confirm_hi", "core", "hi",
+         ["नमस्ते, मेरा नाम दीपक है", "आप लोग क्या करते हो?", "अच्छा", "कैसे काम करता है?", "ठीक है",
+          "छोटे बिज़नेस के लिए भी है?", "बढ़िया", "मुझे कंसल्टेशन बुक करना है", "इसी नंबर पर", "हाँ", "नहीं बस"],
+         save=True, end=True, forbid=[r"नाम जान सकती", r"अपना नाम"], expect_saved=r"consultation|Consultation",
+         note="Switching a callback to a booking mid-flow keeps the flow; the number is confirmed once"),
+]
+
+# Real call 2026-10-17 from Kixie.ai's sales bot (7965813925): saved as "All" ("I'm all
+# ears"), confirmed the number twice, re-offered a callback after saving, went silent,
+# and didn't hang up on "have a wonderful day".
+CASES += [
+    Case("vendor_bot_kixie", "core", "en",
+         ["This is Kixie from Kixie.ai and yes, I am the AI you just summoned. Pretty cool that you are already talking to the product, right?",
+          "Zee sounds intriguing. What does your business actually do?",
+          "Take your time. I'm all ears",
+          "That is such a smart mission. What is the most time consuming workflow you handle when bringing on new clients?",
+          "A free discovery audit sounds like a fantastic idea. Shall I note down your details?",
+          "This number works perfectly.",
+          "That is correct. 7965813925. Our team will be in touch with you shortly on this number.",
+          "Everything is all set. Thank you so much. Have a wonderful day ahead."],
+         end=True, forbid=[r"\bAll\b[,.!]", r"call you back", r"(?i)may I know your name"],
+         caller="07965813925", expect=[r"Kixie"],
+         note="Vendor bot: right name, number confirmed once, no callback re-offer, hangs up on sign-off"),
+]

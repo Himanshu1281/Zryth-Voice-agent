@@ -334,3 +334,19 @@ def test_talk_to_team_hindi(text):
 def test_stop_words(text, expected):
     from intents import STOP_NOW
     assert bool(STOP_NOW.search(text)) == expected
+
+
+@pytest.mark.parametrize("text", [
+    "Everything is all set. Thank you so much. Have a wonderful day ahead.",
+    "have a great day", "okay take care",
+])
+def test_signoff_is_goodbye(text):
+    from intents import CLEAR_GOODBYE
+    assert CLEAR_GOODBYE.search(text)
+
+
+def test_vendor_pitch_is_never_a_lead():
+    from tools import call_outcome
+    assert call_outcome("consultation_booked", "book_consultation", vendor=True) == "vendor_pitch"
+    assert call_outcome("vendor_pitch", "capture_lead") == "vendor_pitch"
+    assert call_outcome("answered", "book_consultation") == "consultation_booked"
